@@ -174,3 +174,7 @@ cython_debug/
 
 # Visual Studio Code
 .vscode/
+# Local DFlash training outputs
+output/
+logs/
+*.log
