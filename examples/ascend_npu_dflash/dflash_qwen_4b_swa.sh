@@ -59,9 +59,9 @@ PY
 # ============ Configuration ============
 MODEL="/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c/"
 DATASET="/home/n84449292/m84379596/Huggingface/datasets/open_perfectblend_full.jsonl"
-OUTPUT_DIR="./output/dflash_separate_qwen3_4b"
+OUTPUT_DIR="./output/dflash_qwen4b_swa_new_dataset"
 VLLM_PORT=8000
-MAX_SAMPLES=1420909
+MAX_SAMPLES=1420905
 # MAX_SAMPLES=1420
 
 # ---- Sequence lengths -------------------------------------------------------
@@ -92,6 +92,8 @@ BLOCK_SIZE=16
 MAX_ANCHORS=512
 NUM_LAYERS=5
 TARGET_LAYER_IDS="1 9 17 25 33"
+SLIDING_WINDOW=1024
+SLIDING_WINDOW_INDICES="0 1 2 3 4"
 
 # VOCAB: Qwen3-4B verifier full vocab is 151936. The z-lab Qwen3-4B-DFlash-b16
 # checkpoint uses the FULL vocab, so omit --draft-vocab-size when equal.
@@ -254,6 +256,8 @@ ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --draft-arch qwen3 \
     --draft-hidden-act silu \
     --draft-attn-impl sdpa \
+    --sliding-window "$SLIDING_WINDOW" \
+    --sliding-window-indices $SLIDING_WINDOW_INDICES \
     --mask-token-id 151669 \
     --scheduler-type cosine \
     --logger tensorboard \
@@ -267,6 +271,7 @@ ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --no-resume-from-checkpoint \
     --seed "$SEED"
 
+# --loss-fn ce \
 echo "=== Step 4: final drafter config (authoritative, from saved checkpoint) ==="
 FINAL_CFG=$(ls -t "$OUTPUT_DIR"/checkpoints/*/config.json 2>/dev/null | head -1)
 
