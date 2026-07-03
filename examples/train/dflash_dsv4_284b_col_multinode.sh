@@ -4,41 +4,46 @@
 #
 # RUN ON BOTH NODES:
 #   parent 80.5.5.108:
-#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 0  2>&1 | tee ./logs/train_dsv4_00.log
+#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 0 2>&1 | tee ./logs/train_dsv4_108.log
 #
 #   child 80.5.5.109:
-#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 1  2>&1 | tee ./logs/train_dsv4_11.log
-#
-# QUIET MODE, default:
-#   normal training logs, loss lines, tracebacks, and key errors are kept;
-#   noisy CANN/vLLM spam is suppressed.
-#
-# DEBUG MODE:
-#   DEBUG_LOGS=1 bash examples/train/dflash_dsv4_284b_col_multinode.sh 0  2>&1 | tee ./logs/train_dsv4_0_debug.log
-#
-# RAW UNFILTERED LOG:
-#   LOG_FILTER=0 bash examples/train/dflash_dsv4_284b_col_multinode.sh 0  2>&1 | tee ./logs/train_dsv4_0_raw.log
+#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 1 2>&1 | tee ./logs/train_dsv4_109.log
 # ============================================================================
 
 set -eo pipefail
 
 NODE_RANK="${1:?usage: bash dflash_dsv4_284b_col_multinode.sh <node_rank 0|1>   (0=parent, 1=child)}"
 
-source /home/n84449292/m84379596/CANN/CANN9.0.0/ascend-toolkit/set_env.sh
-source /home/n84449292/m84379596/CANN/CANN9.0.0/nnal/atb/set_env.sh
+if [ "$NODE_RANK" != "0" ] && [ "$NODE_RANK" != "1" ]; then
+    echo "ERROR: NODE_RANK must be 0 or 1, got: $NODE_RANK"
+    exit 1
+fi
+
+# ===================== NEW ENV / REPO PATHS =====================
+SPEC_MAIN="/home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main"
+CANN_HOME="/home/n84449292/m84379596/CANN/CANN9.0.0"
+ENV_PREFIX="/home/n84449292/m84379596/conda/vllm-ascend-0202"
+
+PY="$ENV_PREFIX/bin/python"
+TORCHRUN=("$PY" -m torch.distributed.run)
+
+# Start clean, like your new one-node training script.
+unset PYTHONPATH
+
+source "$CANN_HOME/ascend-toolkit/set_env.sh"
+source "$CANN_HOME/nnal/atb/set_env.sh"
+
+# Keep CANN PYTHONPATH entries and prepend new source repos.
+export PYTHONPATH="$SPEC_MAIN/speculators/src:$SPEC_MAIN/vllm:$SPEC_MAIN/vllm-ascend:${PYTHONPATH:-}"
+export PATH="$ENV_PREFIX/bin:$PATH"
 
 # ===================== Logging controls =====================
-# Default: quiet training logs.
-# Set DEBUG_LOGS=1 for full Ascend/vLLM debug output.
 DEBUG_LOGS="${DEBUG_LOGS:-0}"
-
-# Default: filter known noisy torchrun lines before they reach console/tee.
-# Set LOG_FILTER=0 to keep raw torchrun output.
 LOG_FILTER="${LOG_FILTER:-1}"
 
 if [ "$DEBUG_LOGS" = "1" ]; then
     export ASCEND_LAUNCH_BLOCKING=1
-   export ASCEND_SLOG_PRINT_TO_STDOUT=1
+    export ASCEND_SLOG_PRINT_TO_STDOUT=1
     export ASCEND_GLOBAL_LOG_LEVEL=3
     export VLLM_LOGGING_LEVEL=INFO
     unset PYTHONWARNINGS
@@ -46,26 +51,14 @@ if [ "$DEBUG_LOGS" = "1" ]; then
     echo "[node $NODE_RANK] DEBUG_LOGS=1: verbose Ascend/vLLM logging enabled"
 else
     unset ASCEND_LAUNCH_BLOCKING
-
-    # Do not stream CANN SLOG to stdout during normal training.
     export ASCEND_SLOG_PRINT_TO_STDOUT=0
-
-    # Quiet CANN host logging as much as possible.
-    # If your CANN build rejects level 4, change this to 3.
     export ASCEND_GLOBAL_LOG_LEVEL=4
     export ASCEND_GLOBAL_EVENT_ENABLE=0
-
-    # Quiet vLLM INFO logs. Tracebacks and Python exceptions still show.
     export VLLM_LOGGING_LEVEL=WARNING
-
-    # Suppress repeated Python warning spam.
     export PYTHONWARNINGS="ignore::DeprecationWarning,ignore::UserWarning"
-
     echo "[node $NODE_RANK] quiet logging enabled; use DEBUG_LOGS=1 for full logs"
 fi
 
-# Filter only known high-volume noise. Keep Traceback, RuntimeError,
-# OutOfMemoryError, FileNotFoundError, SafetensorError, loss, and checkpoints.
 QUIET_LOG_FILTER='TypedStorage is deprecated|pin_memory.py:57|Qwen2VLImageProcessorFast|`rope_parameters`|Get a block from the existing pool failed|This error log can be ignored|Dumping input data for V1 LLM engine|Dumping scheduler output for model execution|^\[INFO\] (DRV|HCCL|HCCP|ASCENDCL)\(|^\[WARNING\] .*warnings.py:110|^\[INFO\] RUNTIME\(.*SetWatchDogDevStatus|^\[INFO\] HCCL\(.*HCCL_TRACE'
 
 # ===================== Ascend / vLLM-Ascend env =====================
@@ -76,15 +69,14 @@ unset VLLM_ASCEND_ENABLE_FLASHCOMM1
 export TASK_QUEUE_ENABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-# Smoke-test / current workaround: bypass npu_quant_lightning_indexer in dsa_v1.py.
-# Keep this only if your DFLASH_DISABLE_QLI patch is applied.
 export DFLASH_DISABLE_QLI=1
 export DSV4_VLLM_SERVE_PATCH=1
 
 # ===================== CONFIG, identical on both nodes =====================
 PARENT_IP="80.5.5.108"
 CHILD_IP="80.5.5.109"
-MASTER_PORT=29500
+MASTER_PORT="${MASTER_PORT:-29500}"
+
 NNODES=2
 NPROC_PER_NODE=8
 TARGET_TP_SIZE=16
@@ -107,7 +99,6 @@ BLOCK_SIZE=10
 MAX_ANCHORS=128
 VERIFIER_VOCAB=129280
 DRAFT_VOCAB_SIZE=129280
-# DRAFT_VOCAB_SIZE=32768
 NUM_LAYERS=3
 TARGET_LAYER_IDS="2 20 40"
 
@@ -121,27 +112,58 @@ export HCCL_CONNECT_TIMEOUT=1800
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 
-# Cross-node Gloo/HCCL must bind to the routable NIC, not loopback.
-NET_IFACE="$(ip -o -4 addr show | awk '/80\.5\.5\./{print $2; exit}')"
+# Cross-node Gloo/HCCL must bind to the routable NIC.
+if [ "$NODE_RANK" = "0" ]; then
+    EXPECTED_IP="$PARENT_IP"
+else
+    EXPECTED_IP="$CHILD_IP"
+fi
+
+NET_IFACE="$(ip -o -4 addr show | awk -v ip="$EXPECTED_IP" '{split($4,a,"/"); if (a[1] == ip) {print $2; exit}}')"
+
 if [ -z "$NET_IFACE" ]; then
-    echo "ERROR: no NIC with an 80.5.5.x address on this node."
+    echo "ERROR: NODE_RANK=$NODE_RANK expects IP $EXPECTED_IP, but no NIC has that IP."
     echo "Run: ip -o -4 addr show"
     exit 1
 fi
 
-echo "[node $NODE_RANK] binding distributed traffic to NIC: $NET_IFACE ($(ip -o -4 addr show dev "$NET_IFACE" | awk '{print $4}'))"
+LOCAL_IP="$(ip -o -4 addr show dev "$NET_IFACE" | awk -v ip="$EXPECTED_IP" '{split($4,a,"/"); if (a[1] == ip) {print a[1]; exit}}')"
+
+echo "[node $NODE_RANK] binding distributed traffic to NIC: $NET_IFACE ($LOCAL_IP)"
+echo "[node $NODE_RANK] parent=$PARENT_IP child=$CHILD_IP master_port=$MASTER_PORT"
+echo "[node $NODE_RANK] SPEC_MAIN=$SPEC_MAIN"
+echo "[node $NODE_RANK] PY=$PY"
 
 export GLOO_SOCKET_IFNAME="$NET_IFACE"
 export HCCL_SOCKET_IFNAME="$NET_IFACE"
 export TP_SOCKET_IFNAME="$NET_IFACE"
 
-cd /home/n84449292/m84379596/DFlash/vLLM_NPU/speculators
+cd "$SPEC_MAIN/speculators"
 mkdir -p logs
 
+echo "=== [node $NODE_RANK] import sanity check ==="
+"$PY" - <<'PY'
+import sys
+import torch
+import torch_npu
+import vllm
+import vllm_ascend
+import speculators
+
+print("python:", sys.executable)
+print("torch:", torch.__version__)
+print("torch_npu:", torch_npu.__version__)
+print("vllm:", vllm.__file__)
+print("vllm_ascend:", vllm_ascend.__file__)
+print("speculators:", speculators.__file__)
+print("IMPORTS OK")
+PY
+
 echo "=== [node $NODE_RANK] cleanup old local processes and hidden-state files ==="
-pkill -9 -f "scripts/train.py" 2>/dev/null || true
-pkill -9 -f "torchrun"        2>/dev/null || true
-pkill -9 -f "EngineCore"      2>/dev/null || true
+pkill -9 -f "scripts/train.py"      2>/dev/null || true
+pkill -9 -f "torchrun"              2>/dev/null || true
+pkill -9 -f "torch.distributed.run" 2>/dev/null || true
+pkill -9 -f "EngineCore"            2>/dev/null || true
 
 rm -rf "$SHARED_STORAGE_PATH"
 mkdir -p "$SHARED_STORAGE_PATH"
@@ -150,6 +172,27 @@ echo "[node $NODE_RANK] /dev/shm usage after cleanup:"
 df -h /dev/shm || true
 du -sh "$SHARED_STORAGE_PATH" 2>/dev/null || true
 sleep 2
+
+echo "=== [node $NODE_RANK] NPU preflight ==="
+npu-smi info || true
+
+IFS=',' read -ra DEV_ARR <<< "$LOCAL_NPUS"
+if [ "${#DEV_ARR[@]}" -ne "$NPROC_PER_NODE" ]; then
+    echo "ERROR: LOCAL_NPUS has ${#DEV_ARR[@]} entries but NPROC_PER_NODE=$NPROC_PER_NODE"
+    exit 1
+fi
+
+for r in $(seq 0 $((NPROC_PER_NODE - 1))); do
+    echo "[node $NODE_RANK] testing local_rank=$r"
+    ASCEND_RT_VISIBLE_DEVICES="$LOCAL_NPUS" TEST_LOCAL_RANK="$r" "$PY" - <<'PY'
+import os
+import torch
+
+r = int(os.environ["TEST_LOCAL_RANK"])
+torch.accelerator.set_device_index(r)
+print(f"OK local_rank={r}")
+PY
+done
 
 # ---- each node tokenizes its OWN local copy ----
 mkdir -p "$DATA_OUT"
@@ -160,8 +203,7 @@ if [ -n "${MAX_SAMPLES:-}" ]; then
     PREP_MAX_SAMPLES_ARGS=(--max-samples "$MAX_SAMPLES")
 fi
 
-echo "=== [node $NODE_RANK] prepare_data, node-local copy at $DATA_OUT ==="
-python scripts/prepare_data.py \
+"$PY" scripts/prepare_data.py \
     --model "$MODEL" \
     --data "$DATASET" \
     --output "$DATA_OUT" \
@@ -171,7 +213,7 @@ python scripts/prepare_data.py \
     --overwrite
 
 rm -f "$DATA_OUT/d2t.npy" "$DATA_OUT/t2d.npy"
-# Content fingerprint, order-independent over files.
+
 FP=$(find "$DATA_OUT" -type f ! -name '.*' ! -path '*/checkpoints/*' -exec sha256sum {} \; \
      | awk '{print $1}' | sort | sha256sum | awk '{print $1}')
 
@@ -186,9 +228,10 @@ echo "[node $NODE_RANK] DFLASH_DISABLE_QLI=${DFLASH_DISABLE_QLI-UNSET}"
 echo "[node $NODE_RANK] VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1-UNSET}"
 echo "[node $NODE_RANK] ASCEND_SLOG_PRINT_TO_STDOUT=${ASCEND_SLOG_PRINT_TO_STDOUT-UNSET}"
 echo "[node $NODE_RANK] ASCEND_GLOBAL_LOG_LEVEL=${ASCEND_GLOBAL_LOG_LEVEL-UNSET}"
+echo "[node $NODE_RANK] PYTHONPATH=$PYTHONPATH"
 
 run_train() {
-    ASCEND_RT_VISIBLE_DEVICES="$LOCAL_NPUS" torchrun \
+    ASCEND_RT_VISIBLE_DEVICES="$LOCAL_NPUS" "${TORCHRUN[@]}" \
         --nnodes "$NNODES" \
         --node_rank "$NODE_RANK" \
         --master_addr "$PARENT_IP" \
@@ -227,10 +270,8 @@ run_train() {
         --no-resume-from-checkpoint \
         --seed "$SEED"
 }
-# --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-# --no-resume-from-checkpoint
+
 if [ "$LOG_FILTER" = "1" ]; then
-    # Preserve torchrun exit status while filtering high-volume known-noise lines.
     set +e
     run_train 2>&1 | stdbuf -oL grep -Ev "$QUIET_LOG_FILTER"
     TORCH_STATUS=${PIPESTATUS[0]}

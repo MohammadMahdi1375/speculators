@@ -31,3 +31,42 @@ def resolve_target_layer_ids(
         stacklevel=3,
     )
     return target_layer_ids
+
+# ---------------------------------------------------------------------------
+# Compatibility shim for fork modules kept by the dsv4 no-deletion overlay.
+# DSpark/MTP/PEagle import this from speculators.models.utils.
+# ---------------------------------------------------------------------------
+def conditional_torch_compile(func=None, **compile_kwargs):
+    """Conditionally apply torch.compile, otherwise return the object unchanged.
+
+    Supports both:
+        @conditional_torch_compile
+        def f(...): ...
+
+    and:
+        @conditional_torch_compile(...)
+        def f(...): ...
+    """
+
+    def _decorator(obj):
+        import os
+
+        if os.environ.get("TORCH_COMPILE_DISABLE") == "1":
+            return obj
+        if os.environ.get("TORCHDYNAMO_DISABLE") == "1":
+            return obj
+
+        try:
+            import torch
+            torch_compile = getattr(torch, "compile", None)
+            if torch_compile is None:
+                return obj
+            return torch_compile(obj, **compile_kwargs)
+        except Exception:
+            return obj
+
+    if func is None:
+        return _decorator
+
+    return _decorator(func)
+
