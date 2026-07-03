@@ -1,22 +1,13 @@
 import asyncio
-import fcntl
 import functools
 import logging
-import os
 import time
-from typing import TYPE_CHECKING, Any, TypedDict
 
 import openai
-from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
-from openai.types.completion import Completion
-from typing_extensions import NotRequired
-
-if TYPE_CHECKING:
-    from collections.abc import Coroutine
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REQUEST_TIMEOUT = 120  # seconds
+DEFAULT_REQUEST_TIMEOUT = 15  # seconds
 DEFAULT_MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # seconds
 
@@ -91,14 +82,8 @@ def with_retries(fn):
     return sync_wrapper
 
 
-def extract_output(
-    response: Completion | ChatCompletion,
-    token_ids: list[int],
-) -> str:
-    if isinstance(response, Completion):
-        prompt_token_ids = getattr(response.choices[0], "prompt_token_ids", None)
-    else:
-        prompt_token_ids = getattr(response, "prompt_token_ids", None)
+def extract_output(completion, token_ids) -> str:
+    prompt_token_ids = getattr(completion.choices[0], "prompt_token_ids", None)
 
     if prompt_token_ids is None:
         raise InvalidResponseError("Response missing prompt_token_ids")
@@ -108,69 +93,17 @@ def extract_output(
             f"Prompt token IDs mismatch: expected {token_ids}, got {prompt_token_ids}"
         )
 
-    kv_transfer_params = getattr(response, "kv_transfer_params", None)
-    if kv_transfer_params is None:
+    if not hasattr(completion, "kv_transfer_params"):
         raise InvalidResponseError("Response missing kv_transfer_params")
 
-    return kv_transfer_params.get("hidden_states_path")
-
-
-class ClientItem(TypedDict):
-    input_ids: list[int]
-    """The input token IDs."""
-
-    messages: NotRequired[list[ChatCompletionMessageParam]]
-    """If provided, pass `messages` to Chat Completions API
-    instead of passing `token_ids` to Completions API."""
-
-
-async def _poll_lock_async(fd, poll_interval):
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            await asyncio.sleep(poll_interval)
-
-
-async def wait_for_lock_async(lock_path, timeout=10.0, poll_interval=0.1):
-    fd = os.open(lock_path, os.O_RDONLY)
-    try:
-        await asyncio.wait_for(_poll_lock_async(fd, poll_interval), timeout=timeout)
-    except BaseException:
-        os.close(fd)
-        raise
-    os.close(fd)
-    os.remove(lock_path)
-
-
-def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
-    fd = os.open(lock_path, os.O_RDONLY)
-    try:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for lock: {lock_path}"
-                    ) from None
-                time.sleep(poll_interval)
-    except BaseException:
-        os.close(fd)
-        raise
-    os.close(fd)
-    os.remove(lock_path)
+    return completion.kv_transfer_params.get("hidden_states_path")
 
 
 @with_retries
 async def generate_hidden_states_async(
     client: openai.AsyncClient,
     model: str,
-    client_item: ClientItem,
-    *,
+    token_ids: list[int],
     timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
 ) -> str:
     """
@@ -180,70 +113,62 @@ async def generate_hidden_states_async(
     Args:
         client: The async OpenAI client.
         model: The model ID.
-        client_item: Inputs to send via the client.
+        token_ids: The input token IDs.
         timeout: Timeout in seconds for each request attempt. None for no timeout.
     """
-    token_ids = client_item["input_ids"]
-    messages = client_item.get("messages")
-
-    coro: Coroutine[Any, Any, Completion | ChatCompletion]
-    if messages is None:
-        coro = client.completions.create(
-            model=model,
-            prompt=token_ids,
-            max_tokens=1,
-            extra_body={"return_token_ids": True},
-            timeout=timeout,
-        )
-    else:
-        coro = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=1,
-            extra_body={"add_generation_prompt": False, "return_token_ids": True},
-            timeout=timeout,
-        )
-
-    res: Completion | ChatCompletion
+    coro = client.completions.create(
+        model=model,
+        prompt=token_ids,
+        max_tokens=1,
+        extra_body={"return_token_ids": True},
+        timeout=timeout,
+    )
     if timeout is not None:
-        res = await asyncio.wait_for(coro, timeout=timeout)
+        completion = await asyncio.wait_for(coro, timeout=timeout)
     else:
-        res = await coro
+        completion = await coro
 
-    return extract_output(res, token_ids)
+    return extract_output(completion, token_ids)
 
 
 @with_retries
 def generate_hidden_states(
     client: openai.Client,
     model: str,
-    client_item: ClientItem,
-    *,
+    token_ids: list[int],
     timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
 ) -> str:
     """
     Runs decode w/ max_tokens 1 to generate hidden states and returns path to
     hidden states file.
     """
+    completion = client.completions.create(
+        model=model,
+        prompt=token_ids,
+        max_tokens=1,
+        extra_body={"return_token_ids": True},
+        timeout=timeout,
+    )
+    return extract_output(completion, token_ids)
+
+
+# @Moh_7596 in-process hidden-state generation (external_launcher engine)
+from vllm import SamplingParams  # noqa: E402
+
+
+def generate_hidden_states_inprocess(engine, client_item, *, seed: int = 42):
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
-
-    res: Completion | ChatCompletion
+    sp = SamplingParams(max_tokens=1, temperature=0.0, seed=seed)
     if messages is None:
-        res = client.completions.create(
-            model=model,
-            prompt=token_ids,
-            max_tokens=1,
-            extra_body={"return_token_ids": True},
-            timeout=timeout,
-        )
+        outputs = engine.generate({"prompt_token_ids": token_ids}, sp)
     else:
-        res = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=1,
-            extra_body={"add_generation_prompt": False, "return_token_ids": True},
-            timeout=timeout,
-        )
-
-    return extract_output(res, token_ids)
+        outputs = engine.chat(messages, sp, add_generation_prompt=False)
+    out = outputs[0]
+    ptids = list(out.prompt_token_ids) if getattr(out, "prompt_token_ids", None) is not None else None
+    if ptids is not None and ptids != token_ids:
+        raise InvalidResponseError(f"Prompt token IDs mismatch: expected {token_ids}, got {ptids}")
+    kv = getattr(out, "kv_transfer_params", None)
+    if not kv or "hidden_states_path" not in kv:
+        raise InvalidResponseError("RequestOutput missing kv_transfer_params/hidden_states_path")
+    return kv["hidden_states_path"]

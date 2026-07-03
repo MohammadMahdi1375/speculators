@@ -5,59 +5,25 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import contextmanager
-from functools import wraps
 from pathlib import Path
 from textwrap import indent
 
 from loguru import logger
-from PIL import Image
-
-from speculators.data_generation.preprocessing import load_raw_dataset
 
 __all__ = [
     "SCRIPTS_DIR",
     "VLLM_PYTHON",
     "launch_vllm_server",
     "launch_vllm_server_context",
-    "purge_newfiles",
     "run_data_generation_offline",
     "run_prepare_data",
-    "run_stitch_mtp",
     "run_training",
     "run_vllm_engine",
     "stop_vllm_server",
     "wait_for_server",
 ]
-
-
-def purge_newfiles(fn: Callable[..., Path]):
-    """Decorator that turns a Path-returning function into a context manager.
-
-    On exit, deletes top-level files in the resolved directory whose mtime is
-    newer than when the wrapped function returned.  Does not recurse into
-    subdirectories.  This prevents generated artifacts (e.g. ``d2t.npy``,
-    ``t2d.npy`` potentially cached by ``train.py``) from persisting in
-    shared directories (such as the HF snapshot cache) between test runs.
-    """
-
-    @wraps(fn)
-    @contextmanager
-    def wrapper(*args, **kwargs):
-        path = fn(*args, **kwargs)
-        cutoff = time.time()
-        try:
-            yield path
-        finally:
-            if path.is_dir():
-                for f in path.iterdir():
-                    if f.is_file() and f.stat().st_mtime > cutoff:
-                        f.unlink()
-                        logger.info("Purged generated artifact: {}", f.name)
-
-    return wrapper
-
 
 VLLM_PYTHON = os.environ.get("VLLM_PYTHON", sys.executable)
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
@@ -65,7 +31,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
 
 def wait_for_server(
     port: int,
-    timeout: float = 600.0,
+    timeout: float = 180.0,
     poll_interval: float = 2.0,
     process: subprocess.Popen | None = None,
 ):
@@ -99,12 +65,9 @@ def launch_vllm_server(
     model: str,
     port: int,
     hidden_states_path: str,
-    *,
     max_model_len: int = 513,
     gpu_memory_utilization: float = 0.5,
     target_layer_ids: list[int] | None = None,
-    enforce_eager: bool = False,
-    allowed_local_media_path: str | None = None,
 ) -> subprocess.Popen:
     """Launch a vLLM server configured for hidden-state extraction.
 
@@ -120,10 +83,6 @@ def launch_vllm_server(
     ]
     if target_layer_ids is not None:
         cmd += ["--target-layer-ids"] + [str(lid) for lid in target_layer_ids]
-    if enforce_eager:
-        cmd += ["--enforce-eager"]
-    if allowed_local_media_path is not None:
-        cmd += ["--allowed-local-media-path", allowed_local_media_path]
     cmd += [
         "--",
         "--port",
@@ -176,41 +135,21 @@ def launch_vllm_server_context(*args, **kwargs):
         stop_vllm_server(process)
 
 
-def setup_dummy_sharegpt4v_coco(coco_dir: Path):
-    """Enable ShareGPT4V to be used without downloading the actual COCO dataset."""
-    coco_dir.mkdir(parents=True, exist_ok=True)
-
-    dummy_image = Image.new("RGB", (256, 256))
-    dummy_image_path = coco_dir / "dummy.png"
-    dummy_image.save(dummy_image_path)
-
-    raw_dataset, normalize_fn = load_raw_dataset("sharegpt4v_coco")
-
-    # Use symlinks to avoid copying the image
-    for raw_path in raw_dataset["image"]:
-        image_path = coco_dir / raw_path.removeprefix("coco/")
-
-        if not image_path.exists():
-            image_path.parent.mkdir(parents=True, exist_ok=True)
-            image_path.symlink_to(dummy_image_path)
-
-
 def run_prepare_data(
     model: str,
-    data: str,
     data_path: Path,
     max_samples: int = 50,
     seq_length: int = 512,
     timeout: float | None = None,
 ):
-    """Tokenize data using prepare_data.py."""
+    """Tokenize ShareGPT data using prepare_data.py."""
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "prepare_data.py"),
         "--model",
         model,
         "--data",
-        data,
+        "sharegpt",
         "--output",
         str(data_path),
         "--max-samples",
@@ -334,36 +273,10 @@ def run_training(
     assert result.returncode == 0, f"train.py failed:\n{result.stderr}"
 
 
-def run_stitch_mtp(
-    finetuned_checkpoint: Path,
-    verifier_path: str,
-    output_path: Path,
-    timeout: float | None = None,
-):
-    cmd = [
-        sys.executable,
-        str(SCRIPTS_DIR / "stitch_mtp.py"),
-        str(finetuned_checkpoint),
-        verifier_path,
-        "--output-path",
-        str(output_path),
-    ]
-    logger.info("Stitching MTP weights: {}", " ".join(cmd))
-    result = subprocess.run(  # noqa: S603
-        cmd, capture_output=True, text=True, check=False, timeout=timeout
-    )
-    assert result.returncode == 0, f"stitch_mtp.py failed:\n{result.stderr}"
-
-
 def run_vllm_engine(
     model_path: str,
     tmp_path: Path,
     prompts: list[list[dict[str, str]]],
-    max_model_len: int = 1024,
-    gpu_memory_utilization: float = 0.8,
-    enforce_eager: bool = False,
-    allowed_local_media_path: str | None = None,
-    speculative_config: dict | None = None,
     disable_compile_cache: bool = False,
     max_tokens: int = 50,
     ignore_eos: bool = True,
@@ -376,31 +289,26 @@ def run_vllm_engine(
     run_vllm_file = str(Path(__file__).with_name("run_vllm.py"))
     results_file = str(tmp_path / "results.json")
 
-    sampling_params_dict = {
-        "temperature": 0,
-        "top_p": 0.9,
-        "max_tokens": max_tokens,
-        "ignore_eos": ignore_eos,
-    }
-
-    llm_args_dict = {
-        "model": model_path,
-        "max_model_len": max_model_len,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "enforce_eager": enforce_eager,
-    }
-    if allowed_local_media_path is not None:
-        llm_args_dict["allowed_local_media_path"] = allowed_local_media_path
-    if speculative_config is not None:
-        llm_args_dict["speculative_config"] = speculative_config
-
     command = [
         VLLM_PYTHON,
         run_vllm_file,
         "--sampling-params-args",
-        json.dumps(sampling_params_dict),
+        json.dumps(
+            {
+                "temperature": 0,
+                "top_p": 0.9,
+                "max_tokens": max_tokens,
+                "ignore_eos": ignore_eos,
+            }
+        ),
         "--llm-args",
-        json.dumps(llm_args_dict),
+        json.dumps(
+            {
+                "model": model_path,
+                "max_model_len": 1024,
+                "gpu_memory_utilization": 0.8,
+            }
+        ),
         "--prompts",
         json.dumps(prompts),
         "--results-file",

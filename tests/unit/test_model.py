@@ -16,10 +16,6 @@ from speculators import (
     VerifierConfig,
     reload_schemas,
 )
-from speculators.models.dflash.core import DFlashDraftModel
-from speculators.models.eagle3.core import Eagle3DraftModel
-from speculators.models.mtp.core import MTPDraftModel
-from speculators.models.peagle.core import PEagleDraftModel
 from speculators.proposals import GreedyTokenProposalConfig
 
 # ===== Test Helper Classes =====
@@ -129,8 +125,8 @@ def test_speculator_model_registered_model_class_from_config_invalid():
         test_param=456,
         speculators_config=SpeculatorsConfig(
             algorithm="test_algorithm",
-            proposal_methods=[GreedyTokenProposalConfig()],
-            default_proposal_method="greedy",
+            proposal_methods=[],
+            default_proposal_method="test_proposal",
             verifier=VerifierConfig(
                 name_or_path="test/verifier",
                 architectures=["TestModel"],
@@ -150,8 +146,8 @@ def test_speculator_model_registered_model_class_from_config_invalid():
     config = UnregisteredConfig(
         speculators_config=SpeculatorsConfig(
             algorithm="test_algorithm",
-            proposal_methods=[GreedyTokenProposalConfig()],
-            default_proposal_method="greedy",
+            proposal_methods=[],
+            default_proposal_method="test_proposal",
             verifier=VerifierConfig(
                 name_or_path="test/verifier",
                 architectures=["TestModel"],
@@ -300,27 +296,3 @@ def test_speculator_model_forward_abstract(speculator_model_test_config):
         NotImplementedError, match="The forward method is only supported on concrete"
     ):
         model.forward()
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    "model_class",
-    [Eagle3DraftModel, DFlashDraftModel, PEagleDraftModel, MTPDraftModel],
-)
-def test_save_ignore_keys_are_ignored_on_load_missing(model_class):
-    """Weights excluded from saved checkpoints (e.g. verifier_lm_head, which is
-    reloaded from the verifier via load_verifier_weights) must also be ignored when
-    missing on load. Otherwise loading an initialized/trained checkpoint flags the
-    absent key as missing.
-    """
-    save_ignore = set(getattr(model_class, "_keys_to_ignore_on_save", None) or [])
-    load_missing_ignore = set(
-        getattr(model_class, "_keys_to_ignore_on_load_missing", None) or []
-    )
-
-    not_ignored_on_load = save_ignore - load_missing_ignore
-    assert not not_ignored_on_load, (
-        f"{model_class.__name__} excludes {sorted(not_ignored_on_load)} from saved "
-        "checkpoints but does not list them in _keys_to_ignore_on_load_missing; "
-        "loading a checkpoint will raise on the absent key(s)."
-    )

@@ -9,59 +9,6 @@ from loguru import logger
 from safetensors import safe_open
 
 
-def is_config_only_dir(path: str | Path) -> bool:
-    """Return True if ``path`` is a local directory with a ``config.json`` but no
-    weight files (``*.safetensors`` / ``*.bin``).
-
-    Used to distinguish a saved speculator *config* (from which a fresh draft is
-    initialized) from a full checkpoint whose weights should be loaded.
-
-    :param path: A local directory path. Hub ids and non-directories return False.
-    :return: True when the directory holds a config but no weights.
-    """
-    directory = Path(path)
-    if not directory.is_dir():
-        return False
-    has_config = (directory / "config.json").is_file()
-    # Weight files, plus sharded-checkpoint index files (e.g.
-    # model.safetensors.index.json) -- the latter end in .json and would not match
-    # the *.safetensors / *.bin globs, so a shard manifest must be checked explicitly
-    # to avoid treating an incomplete sharded checkpoint as config-only.
-    has_weights = (
-        any(directory.glob("*.safetensors"))
-        or any(directory.glob("*.bin"))
-        or any(directory.glob("*.safetensors.index.json"))
-        or any(directory.glob("*.bin.index.json"))
-    )
-    return has_config and not has_weights
-
-
-def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
-    """List all tensor keys in a checkpoint without loading weights.
-
-    Supports sharded safetensors (via index) and single safetensors formats.
-
-    :param checkpoint_dir: Path to a local checkpoint directory.
-    :return: List of tensor key names present in the checkpoint.
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-
-    index_path = checkpoint_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with index_path.open() as f:
-            return list(json.load(f)["weight_map"].keys())
-
-    single = checkpoint_dir / "model.safetensors"
-    if single.exists():
-        with safe_open(str(single), framework="pt") as f:
-            return list(f.keys())
-
-    raise FileNotFoundError(
-        f"No safetensors checkpoint found at {checkpoint_dir}. "
-        "Expected model.safetensors.index.json or model.safetensors."
-    )
-
-
 def load_model_layers(
     layer_names: list[str], model_path: str
 ) -> dict[str, torch.Tensor]:
@@ -101,7 +48,7 @@ def load_model_layers(
             if matched:
                 name_to_key[name] = matched
             else:
-                logger.warning(f"Tensor '{name}' not found in weight_map.")
+                logger.error(f"Tensor '{name}' not found in weight_map.")
 
     # group requested names by shard filename
     shard_to_names: dict[str, list[tuple[str, str]]] = {}

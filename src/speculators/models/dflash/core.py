@@ -1,8 +1,8 @@
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask, create_mask
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers import PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
@@ -18,8 +18,7 @@ from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
 )
-from speculators.models.metrics import LossConfig, resolve_loss_config
-from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
+from speculators.models.utils import resolve_target_layer_ids
 
 
 @SpeculatorModel.register("dflash")
@@ -28,10 +27,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
-        "verifier_norm.weight",
-        # verifier_lm_head is reloaded from the verifier (see load_verifier_weights)
-        # and excluded on save, so it is expected to be absent from checkpoints.
-        "verifier_lm_head.weight",
         "t2d",
         "d2t",
     ]
@@ -49,15 +44,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     ) -> None:
         # Forcibly override config settings
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
+            # config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
+            #     "simple_flex_attention"
+            # )
             config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
-                "simple_flex_attention"
+                "sdpa"
             )
-        self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
-        self._create_mask_fn = (
-            create_block_mask
-            if self._attn_impl == "simple_flex_attention"
-            else create_mask
-        )
         super().__init__(config=config)
         self._init_vocab(config)
 
@@ -71,15 +63,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 for layer_idx in range(num_draft_layers)
             ]
         )
-        self.sliding_window = tl_config.sliding_window
-        self.sliding_window_indices = [
-            i
-            for i, layer_type in enumerate(tl_config.layer_types)
-            if layer_type == "sliding_attention"
-        ]
-        self.uses_sliding_window_attn = bool(self.sliding_window_indices)
-        self.uses_full_attn = bool(num_draft_layers - len(self.sliding_window_indices))
-        self.sliding_window_non_causal = config.sliding_window_non_causal
+
+        if config.aux_hidden_state_layer_ids is None:
+            raise ValueError(
+                "aux_hidden_state_layer_ids must be set in DFlashSpeculatorConfig. "
+                "Use DFlashDraftModel.from_training_args() to resolve defaults."
+            )
+        self.target_layer_ids = config.aux_hidden_state_layer_ids
 
         self.norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
@@ -96,18 +86,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.verifier_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
-            eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
-        )
-        self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size
         self.post_init()
-
-    @property
-    def target_layer_ids(self) -> list[int]:
-        """Target layer IDs for auxiliary hidden states."""
-        return self.config.aux_hidden_state_layer_ids
 
     @classmethod
     def from_training_args(
@@ -123,8 +103,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             verifier_config: Verifier model configuration. This should be a config
                 with num_hidden_layers set to the number of DRAFT layers (created
                 by create_transformer_layer_config in train.py).
-            t2d: Target-to-draft vocabulary mapping tensor (optional)
-            d2t: Draft-to-target vocabulary mapping tensor (optional)
+            t2d: Target-to-draft vocabulary mapping tensor (optional, creates
+                identity mapping if None)
+            d2t: Draft-to-target vocabulary mapping tensor (optional, creates
+                identity mapping if None)
             **kwargs: Training arguments with DFlash-specific params
                 - draft_vocab_size: Size of draft vocabulary
                 - block_size: Block size for draft predictions (default: 8)
@@ -138,25 +120,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             The number of draft layers is encoded in verifier_config.num_hidden_layers,
             following the same pattern as EAGLE3.
         """
-        config = DFlashSpeculatorConfig(
-            **cls._build_base_config_kwargs("dflash", verifier_config, **kwargs)
-        )
-
-        model = cls(config=config)
-        model.load_vocab_mappings(t2d, d2t)
-        model.load_verifier_weights()
-        return model
-
-    @staticmethod
-    def _build_base_config_kwargs(
-        algorithm: str,
-        verifier_config: "PretrainedConfig",
-        **kwargs,
-    ) -> dict:
-        """Shared DFlash-family config kwargs for ``from_training_args``.
-
-        DSpark reuses this and appends its Markov/confidence/loss fields.
-        """
         from speculators.config import (  # noqa: PLC0415
             SpeculatorsConfig,
             VerifierConfig,
@@ -166,35 +129,47 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
         target_layer_ids = resolve_target_layer_ids(
-            kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
+            kwargs.get("target_layer_ids"),
+            kwargs["verifier_name_or_path"],
         )
-        verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
-            "draft_attn_impl", "simple_flex_attention"
-        )
-        block_size = kwargs.get("block_size", 8)
-        return {
-            "transformer_layer_config": verifier_config,
-            "draft_vocab_size": kwargs["draft_vocab_size"],
-            "block_size": block_size,
-            "max_anchors": kwargs.get("max_anchors", 3072),
-            "aux_hidden_state_layer_ids": target_layer_ids,
-            "mask_token_id": kwargs.get("mask_token_id"),
-            "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
-            "speculators_config": SpeculatorsConfig(
-                algorithm=algorithm,
+
+        config = DFlashSpeculatorConfig(
+            transformer_layer_config=verifier_config,
+            draft_vocab_size=kwargs["draft_vocab_size"],
+            block_size=kwargs.get("block_size", 8),
+            max_anchors=kwargs.get("max_anchors", 3072),
+            aux_hidden_state_layer_ids=target_layer_ids,
+            mask_token_id=kwargs.get("mask_token_id"),
+            speculators_config=SpeculatorsConfig(
+                algorithm="dflash",
                 proposal_methods=[
-                    # First block position is the anchor, not emitted during gen.
-                    GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+                    GreedyTokenProposalConfig(
+                        # DFlash first position is anchor position, not used during gen
+                        speculative_tokens=kwargs.get("block_size", 8) - 1,
+                    )
                 ],
                 default_proposal_method="greedy",
-                verifier=VerifierConfig.from_pretrained(
-                    kwargs["verifier_name_or_path"]
+                verifier=VerifierConfig.from_config(
+                    verifier_config, name_or_path=kwargs["verifier_name_or_path"]
                 ),
             ),
-        }
+        )
+
+        # Create identity mappings if t2d/d2t not provided (no vocab reduction)
+        if t2d is None or d2t is None:
+            vocab_size = kwargs["draft_vocab_size"]
+            # t2d: all tokens in target vocab are in draft vocab
+            t2d = torch.ones(vocab_size, dtype=torch.bool)
+            # d2t: identity mapping (zero offset for all tokens)
+            d2t = torch.zeros(vocab_size, dtype=torch.long)
+
+        model = cls(config=config)
+        model.load_vocab_mappings(t2d, d2t)
+        model.load_verifier_weights()
+        return model
 
     @staticmethod
-    def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
+    def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:  # noqa: ARG004
         """Get training and validation kwargs for DFlash.
 
         Args:
@@ -203,10 +178,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         Returns:
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
-        loss_config = resolve_loss_config(kwargs["loss_fn"])
-        gamma = kwargs.get("dflash_decay_gamma", 4.0)
-        shared = {"loss_config": loss_config, "gamma": gamma}
-        return dict(shared), dict(shared)
+        train_kwargs: dict[str, Any] = {}
+        val_kwargs: dict[str, Any] = {}
+        return train_kwargs, val_kwargs
 
     @property
     def mask_token_id(self) -> int:
@@ -218,93 +192,64 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         return self.config.mask_token_id
 
-    @torch.compiler.disable
-    def _create_attention_mask(
+    @torch.compile
+    def forward(
         self,
-        document_ids: torch.Tensor,
-        total_seq_len: int,
-        anchor_positions: torch.Tensor,
-        device: torch.device,
-        sliding_window: int | None = None,
-        sliding_window_non_causal: bool = False,
-    ):
-        mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-            document_ids=document_ids.squeeze(0).to(device),
-            total_seq_len=total_seq_len,
-            anchor_positions=anchor_positions,
-            block_size=self.block_size,
-            sliding_window=sliding_window,
-            sliding_window_non_causal=sliding_window_non_causal,
-        )
-        return self._create_mask_fn(
-            mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            device=device,
-        )
-
-    @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, document_ids, device):
-        total_seq_len = loss_mask.shape[1]
-
-        anchor_positions, anchor_valid = select_anchors(
-            loss_mask, self.config.max_anchors, self.block_size
-        )
-
-        full_attn_mask = None
-        if self.uses_full_attn:
-            full_attn_mask = self._create_attention_mask(
-                document_ids=document_ids,
-                total_seq_len=total_seq_len,
-                anchor_positions=anchor_positions,
-                device=device,
-                sliding_window=None,
-            )
-
-        sliding_window_attn_mask = None
-        if self.uses_sliding_window_attn:
-            sliding_window_attn_mask = self._create_attention_mask(
-                document_ids=document_ids,
-                total_seq_len=total_seq_len,
-                anchor_positions=anchor_positions,
-                device=device,
-                sliding_window=self.sliding_window,
-                sliding_window_non_causal=self.sliding_window_non_causal,
-            )
-
-        return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
-
-    def _backbone_forward(
-        self,
-        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # [1, total_seq_len]
-        loss_mask: torch.Tensor,  # [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
-        document_ids: torch.Tensor,  # [1, total_seq_len]
-        position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
+        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: ARG002, E501
+        lengths: torch.Tensor | None = None,  # shape: [batch_size]
+        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         **kwargs,
     ):
-        """Run the anchored-block draft transformer up to the draft logits.
-
-        Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
-        """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = self.config.max_anchors
 
+        if lengths is None:
+            lengths = torch.tensor([total_seq_len], dtype=torch.long, device=device)
         if position_ids is None:
             position_ids = 1 + torch.arange(
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
-        full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, document_ids, device)
+        anchor_positions, anchor_valid = select_anchors(
+            loss_mask, num_anchors, self.block_size
         )
+        # shape: [num_anchors], [num_anchors]
 
+        mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+            lengths=lengths.to(device),
+            total_seq_len=total_seq_len,
+            anchor_positions=anchor_positions,
+            block_size=self.block_size,
+        )
+        ##### @Moh_7596
+        # attention_mask = create_block_mask(
+        #     mask_mod,
+        #     B=None,
+        #     H=None,
+        #     Q_LEN=q_len,
+        #     KV_LEN=kv_len,
+        #     device=device,
+        # )
+        impl = self.config.transformer_layer_config._attn_implementation
+        if impl == "simple_flex_attention":
+            attention_mask = create_block_mask(
+                mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device,
+            )
+        else:
+            q_ids = torch.arange(q_len, device=device)
+            kv_ids = torch.arange(kv_len, device=device)
+            keep = mask_mod(
+                torch.zeros((), dtype=torch.long, device=device),
+                torch.zeros((), dtype=torch.long, device=device),
+                q_ids[:, None],
+                kv_ids[None, :],
+            )  # [q_len, kv_len] bool
+            attention_mask = keep[None, None]  # [1,1,q_len,kv_len] bool for SDPA
+        ###############
         mask_tokens_size = num_anchors * self.block_size
 
         mask_token_ids = torch.full(
@@ -315,54 +260,56 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [1, num_anchors*block_size]
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
         noise_embedding = self.embed_tokens(mask_token_ids)
-        # shape: [1, num_anchors*block_size, hidden_size]
+        # shape: [1, num_anchors*block_size, hidden_size] # noqa: ERA001
 
         fc_output = self.fc(hidden_states)
         fc_output = self.hidden_norm(fc_output)
-        # shape: [1, total_seq_len, hidden_size]
+        # shape: [1, total_seq_len, hidden_size] # noqa: ERA001
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
-            position_ids[0, anchor_positions], self.block_size
+            position_ids[:, anchor_positions], self.block_size, input_ids.numel()
         )
         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
-        # shape: [1, total_seq_len + num_anchors*block_size]
+        # shape: [1, total_seq_len + num_anchors*block_size] # noqa: ERA001
 
         # the hidden_states shape doesn't match position_ids but doesn't need
         # to, as hidden_states is only used to set dtype and device in rotary_emb
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         anchored_block_indices = get_base_indices_for_anchored_blocks(
-            anchor_positions, self.block_size
+            anchor_positions, self.block_size, input_ids.numel()
         )  # shape: [num_anchors*block_size]
 
-        with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
-            # Shift right by 1 so verifier_logits[i] predicts token at position i
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            targets = verifier_logits[:, anchored_block_indices]
-            # shape: [1, num_anchors*block_size, draft_vocab_size]
+        targets = input_ids.clone()[:, anchored_block_indices]
+        # shape: [1, num_anchors*block_size] # noqa: ERA001
 
-        for layer_idx, layer in enumerate(self.layers):
+        for layer in self.layers:
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
 
-        hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
-        # shape: [1, num_anchors*block_size, vocab_size]
+        logits = self.lm_head(self.norm(noise_embedding))
+        # shape: [1, num_anchors*block_size, vocab_size] # noqa: ERA001
+
+        # Convert targets from verifier vocab to draft vocab
+        # t2d is a boolean mask [verifier_vocab_size] - True where
+        # verifier token exists in draft
+        # cumsum gives us the draft index for each verifier token
+        draft_indices = torch.cumsum(self.t2d.long(), dim=0) - 1  # type: ignore[union-attr,operator]
+        targets_draft = torch.where(
+            self.t2d[targets],  # type: ignore[index]
+            draft_indices[targets],  # type: ignore[index]
+            torch.tensor(-100, dtype=torch.long, device=device),
+        )
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
-        # shape: [1, num_anchors*block_size]
+        # shape: [1, num_anchors*block_size] # noqa: ERA001
 
         # zero out any padded anchor blocks
         aligned_loss_mask = aligned_loss_mask * (
@@ -372,38 +319,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [1, num_anchors*block_size]
 
         aligned_loss_mask[:, :: self.block_size] = 0
-
-        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
-
-    @conditional_torch_compile
-    def forward(
-        self,
-        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
-        loss_config: LossConfig | None = None,
-        gamma: float = 4.0,
-        **kwargs,
-    ):
-        _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
-            hidden_states,
-            input_ids,
-            loss_mask,
-            verifier_last_hidden_states,
-            document_ids,
-            position_ids,
-            **kwargs,
-        )
         loss, metrics = compute_metrics(
-            logits,
-            targets,
-            aligned_loss_mask,
-            self.block_size,
-            gamma=gamma,
-            loss_config=loss_config,
+            logits, targets_draft, aligned_loss_mask, self.block_size
         )
         draft_tokens = torch.argmax(logits, dim=-1)
 

@@ -95,10 +95,14 @@ class DraftVocabMixin(nn.Module):
             )
 
         if not self.use_draft_vocab:
-            # draft_vocab_size == verifier_vocab_size, so the mappings would be
-            # identity no-ops; accept and ignore them rather than erroring. Real
-            # data directories may carry full-vocab t2d/d2t files alongside a
-            # checkpoint that does not prune the vocabulary.
+            # Full vocab (no reduction): store the identity mappings directly.
+            # forward unconditionally uses self.t2d, and __init__ registered
+            # t2d/d2t as None for full vocab, so we MUST set real tensors here
+            # (all-True t2d makes cumsum-1 an identity remap). Originally this
+            # raised, blocking full vocab. Assigning to the registered buffer
+            # keeps it a buffer (moves with model.to(device)).
+            self.t2d = t2d
+            self.d2t = d2t
             return
 
         if t2d.shape[0] != self.verifier_vocab_size:
@@ -120,7 +124,7 @@ class DraftVocabMixin(nn.Module):
 
         self.load_state_dict({"t2d": t2d, "d2t": d2t}, strict=False)
 
-    def load_verifier_weights(self):  # noqa: C901
+    def load_verifier_weights(self):
         """Load verifier model weights (embeddings, lm_head, etc.).
 
         Loads embed_tokens, lm_head, and verifier_lm_head weights from the
@@ -128,8 +132,6 @@ class DraftVocabMixin(nn.Module):
         is True. Subclasses can override to load additional weights (e.g. norms,
         tokenizer) by calling super().load_verifier_weights() first.
         """
-        import warnings  # noqa: PLC0415
-
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
 
         speculators_config = getattr(
@@ -141,18 +143,13 @@ class DraftVocabMixin(nn.Module):
         if verifier_config.name_or_path is None:
             return
 
-        # Determine which weights to load based on model attributes
-        weights_to_load = ["embed_tokens.weight", "lm_head.weight"]
-        if hasattr(self, "verifier_norm"):
-            weights_to_load.append("model.norm.weight")
-
         verifier_weights = load_model_layers(
-            weights_to_load,
+            ["embed_tokens.weight", "embed.weight", "lm_head.weight", "head.weight"],
             verifier_config.name_or_path,
         )
 
-        embed_tokens_weight = verifier_weights["embed_tokens.weight"]
-        lm_head_weight = verifier_weights.get("lm_head.weight", embed_tokens_weight)
+        embed_tokens_weight = verifier_weights["embed_tokens.weight"] if "embed_tokens.weight" in verifier_weights else verifier_weights["embed.weight"]
+        lm_head_weight = verifier_weights["lm_head.weight"] if "lm_head.weight" in verifier_weights else verifier_weights.get("head.weight", embed_tokens_weight)
 
         # Load embed_tokens if not already loaded (NaN means uninitialized)
         if self.embed_tokens.weight.isnan().any():
@@ -175,28 +172,6 @@ class DraftVocabMixin(nn.Module):
         self.verifier_lm_head.load_state_dict(
             {"weight": lm_head_weight.detach().clone()}, strict=False
         )
-
-        # Load verifier norm weights if the model has verifier_norm
-        if hasattr(self, "verifier_norm"):
-            if "model.norm.weight" not in verifier_weights:
-                warnings.warn(
-                    f"Could not find final norm weights in "
-                    f"{verifier_config.name_or_path}. "
-                    "Using default initialization (weight=1.0).",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            else:
-                verifier_norm_sd = {"weight": verifier_weights["model.norm.weight"]}
-                self.verifier_norm.load_state_dict(verifier_norm_sd)  # type: ignore[union-attr]
-
-        # HF's from_pretrained resets requires_grad=True on all parameters.
-        # Re-freeze verifier weights that should never be trained.
-        self.embed_tokens.weight.requires_grad_(False)
-        self.lm_head.weight.requires_grad_(False)
-        self.verifier_lm_head.weight.requires_grad_(False)
-        if hasattr(self, "verifier_norm"):
-            self.verifier_norm.weight.requires_grad_(False)  # type: ignore[union-attr]
 
 
 class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc]
@@ -244,7 +219,6 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
         weights_only: bool = True,
         t2d: torch.Tensor | None = None,
         d2t: torch.Tensor | None = None,
-        verifier: str | None = None,
         **kwargs,
     ) -> "SpeculatorModel":
         """
@@ -294,8 +268,6 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
             If None, automatically detects the available format.
         :param weights_only: Whether to only load model weights without optimizer
             states or other training artifacts.
-        :param verifier: Verifier model id/path used to auto-convert an external
-            (non-speculators) checkpoint; ignored for speculators checkpoints.
         :param kwargs: Additional keyword arguments passed to the model constructor
             and loading process.
         :return: A SpeculatorModel instance of the appropriate subclass, loaded with
@@ -307,23 +279,6 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                     "Either `config` or `pretrained_model_name_or_path` must be "
                     "provided to load a SpeculatorModel."
                 )
-            # Auto-convert external (non-speculators) checkpoints so one
-            # `from_pretrained` pathway finetunes both formats. Detect format
-            # once here and only invoke the converter when needed.
-            config_dict, _ = PretrainedConfig.get_config_dict(
-                pretrained_model_name_or_path, cache_dir=cache_dir
-            )
-            if "speculators_model_type" not in config_dict:
-                from speculators.convert.entrypoints import (  # noqa: PLC0415
-                    maybe_convert_external_checkpoint,
-                )
-
-                pretrained_model_name_or_path = maybe_convert_external_checkpoint(
-                    pretrained_model_name_or_path,
-                    verifier=verifier,
-                    cache_dir=cache_dir,
-                    config_dict=config_dict,
-                )
             config = cls.config_class.from_pretrained(
                 pretrained_model_name_or_path,
                 cache_dir=cache_dir,
@@ -334,6 +289,8 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
             )
 
         if not isinstance(config, SpeculatorModelConfig):
+            # once conversion is added, need to handle the case where a non speculator
+            # config is passed in as a kwarg and auto convert
             raise TypeError(
                 f"Expected config to be an instance of SpeculatorModelConfig, "
                 f"got {type(config)}."
@@ -363,7 +320,6 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                 weights_only=weights_only,
                 t2d=t2d,
                 d2t=d2t,
-                verifier=verifier,
                 **kwargs,
             )
 

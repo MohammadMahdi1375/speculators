@@ -6,16 +6,11 @@ from re import Pattern
 
 import pytest
 from loguru import logger as log
-from packaging.version import Version
-from PIL import Image
-from transformers import ProcessorMixin
-from transformers import __version__ as TRANSFORMERS_VERSION  # noqa: N812
+from transformers import AutoTokenizer
 
 from speculators.data_generation.preprocessing import (
     _detect_assistant_pattern,
     _preprocess_batch,
-    get_tokenizer,
-    load_processor,
 )
 
 # Test models covering major template families
@@ -34,33 +29,28 @@ MODELS = [
     "openai/gpt-oss-20b",
 ]
 
-if Version(TRANSFORMERS_VERSION) >= Version("5.5.0"):
-    # Multimodal
-    MODELS.append("google/gemma-4-E2B-it")
-
 
 @pytest.fixture(scope="module", params=MODELS)
-def processor(request):
+def tokenizer(request):
     model_id = request.param
     try:
         # Using trust_remote_code=True for variety of templates
-        return load_processor(model_id, trust_remote_code=True)
+        return AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     except (TypeError, ValueError, KeyError, AttributeError, RuntimeError) as e:
-        pytest.skip(f"Failed to load processor for {model_id}: {e}")
+        pytest.skip(f"Failed to load tokenizer for {model_id}: {e}")
 
 
-def test_regex_detection_across_models(tmp_path, processor):
+def test_regex_detection_across_models(tokenizer):
     """
     Verify that _detect_assistant_pattern and _preprocess_batch (regex path)
     work correctly for a variety of model families.
     """
-    tokenizer = get_tokenizer(processor)
     model_name = tokenizer.name_or_path
     log.info(f"Testing family: {model_name}")
 
     # 1. Detect pattern
     try:
-        pattern = _detect_assistant_pattern(processor)
+        pattern = _detect_assistant_pattern(tokenizer)
     except (ValueError, RuntimeError) as e:
         pytest.fail(f"Failed to detect assistant pattern for {model_name}: {e}")
 
@@ -68,55 +58,20 @@ def test_regex_detection_across_models(tmp_path, processor):
     assert isinstance(pattern, (str, Pattern)), "Pattern must be str or regex object"
 
     # 2. Preprocess a simple multi-turn conversation using REGEX path
-    if isinstance(processor, ProcessorMixin):
-        img_path = str(tmp_path / "blank.png")
-        Image.new("RGB", (256, 256)).save(img_path)
-
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Hello, how are you?"},
-                    {"type": "image", "path": img_path},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "I am a helpful assistant."},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What is the capital"},
-                    {"type": "image", "path": img_path},
-                    {"type": "text", "text": "of France?"},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "The capital of France is Paris.",
-                    },
-                ],
-            },
+    examples = {
+        "conversations": [
+            [
+                {"role": "user", "content": "Hello, how are you?"},
+                {"role": "assistant", "content": "I am a helpful assistant."},
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "The capital of France is Paris."},
+            ]
         ]
-    else:
-        conversation = [
-            {"role": "user", "content": "Hello, how are you?"},
-            {"role": "assistant", "content": "I am a helpful assistant."},
-            {"role": "user", "content": "What is the capital of France?"},
-            {"role": "assistant", "content": "The capital of France is Paris."},
-        ]
-
-    examples = {"conversations": [conversation]}
+    }
 
     # Regex path by passing the explicit pattern
     results = _preprocess_batch(
-        examples, processor, max_length=2048, assistant_pattern=pattern
+        examples, tokenizer, max_length=512, assistant_pattern=pattern
     )
 
     assert len(results["input_ids"]) == 1
@@ -131,7 +86,7 @@ def test_regex_detection_across_models(tmp_path, processor):
 
     # 3. Qualitative check: Assistant content should be masked as 1
     trainable_tokens = input_ids[loss_mask == 1]
-    decoded_assistant = processor.decode(trainable_tokens)
+    decoded_assistant = tokenizer.decode(trainable_tokens)
 
     log.info(f"Decoded trainable regions: {decoded_assistant}")
 
@@ -142,3 +97,7 @@ def test_regex_detection_across_models(tmp_path, processor):
     # It should NOT contain user message content
     assert "Hello" not in decoded_assistant
     assert "France?" not in decoded_assistant
+
+
+if __name__ == "__main__":
+    pass

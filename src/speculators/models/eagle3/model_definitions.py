@@ -1,3 +1,4 @@
+# ruff: noqa: ERA001
 from typing import Any
 
 import torch

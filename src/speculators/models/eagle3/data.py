@@ -1,5 +1,4 @@
-import torch
-
+# ruff: noqa: ERA001
 from speculators.train.data import BatchType
 
 __all__ = ["shift_batch"]
@@ -29,9 +28,7 @@ def shift_batch(batch: BatchType):
     hidden_states = hidden_states[:-1]
     verifier_last_hidden_states = verifier_last_hidden_states[1:]
     loss_mask = loss_mask[1:]
-    # Clamp to 0 so the collate_fn fallback empty sample (seq_len=0) doesn't
-    # produce a negative length.
-    lengths = torch.clamp(lengths - 1, min=0)
+    lengths = lengths - 1
     position_ids = position_ids[1:]  # Note: position_ids now start at 1
 
     return {

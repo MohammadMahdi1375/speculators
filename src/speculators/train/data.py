@@ -1,3 +1,4 @@
+# ruff: noqa: ERA001
 import json
 import math
 import os
@@ -7,7 +8,7 @@ import warnings
 from collections.abc import Callable
 from os import PathLike
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import openai
 import torch
@@ -16,13 +17,11 @@ from datasets import load_from_disk
 from safetensors.torch import load_file
 from torch.utils.data import Dataset
 
-from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
-    ClientItem,
     generate_hidden_states,
-    wait_for_lock,
+    generate_hidden_states_inprocess,
 )
 from speculators.train.noise_transforms import TransformTensors
 
@@ -67,27 +66,21 @@ def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
 StandardizeFnSig = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-def create_empty_sample(
-    hidden_size: int, num_target_layers: int = 3, dtype: torch.dtype = torch.bfloat16
-):
+def create_empty_sample(hidden_size: int):
     # data structure: {
-    #     "hidden_states": [seq_len, num_target_layers * hidden_size],
+    #     "hidden_states": [seq_len, 3 * hidden_size],
     #     "input_ids": [seq_len],
     #     "verifier_last_hidden_states": [seq_len, hidden_size],
     #     "loss_mask": [seq_len],
     #     "lengths": [1],
     #     "position_ids": [seq_len],
     # }
-    # Default dtype is bfloat16 to match the hidden_states dtype used downstream.
-    # When this fallback is used (e.g. vLLM hidden-state extraction times out and
-    # we substitute an empty sample), the implicit float32 placeholders crashed
-    # bf16 EAGLE-3 layers (fc, verifier_lm_head) with a dtype mismatch.
 
     return {
-        "hidden_states": torch.empty(0, num_target_layers * hidden_size, dtype=dtype),
-        "input_ids": torch.empty(0, dtype=torch.long),
-        "verifier_last_hidden_states": torch.empty(0, hidden_size, dtype=dtype),
-        "loss_mask": torch.empty(0, dtype=torch.bool),
+        "hidden_states": torch.empty(0, 3 * hidden_size),
+        "input_ids": torch.empty(0),
+        "verifier_last_hidden_states": torch.empty(0, hidden_size),
+        "loss_mask": torch.empty(0),
         "lengths": torch.tensor([0], dtype=torch.long),
         "position_ids": torch.arange(0, dtype=torch.long),
     }
@@ -107,51 +100,11 @@ def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
     # }
 
     return {
-        "hidden_states": torch.cat(data["hidden_states"][:-1], dim=-1),
+        "hidden_states": torch.cat(data["hidden_states"], dim=-1),
         "input_ids": data["input_ids"],
         "verifier_last_hidden_states": data["hidden_states"][-1],
         "loss_mask": data["loss_mask"],
     }
-
-
-def _has_multimodal_content(messages: list[dict]) -> bool:
-    """True when any turn carries non-text content (images, video, audio).
-
-    Text-only turns store ``content`` as a plain string.  Multimodal turns
-    (produced by ``_adapt_conv_for_vllm``) store it as a list of typed parts,
-    e.g. ``[{"type": "text", ...}, {"type": "image_url", ...}]``.
-    """
-    return any(isinstance(m.get("content"), list) for m in messages)
-
-
-def build_client_item(dataset_item: dict) -> ClientItem:
-    """Build a request payload for vLLM hidden-state extraction.
-
-    When ``messages`` is included, ``generate_hidden_states`` uses the Chat
-    Completions API and vLLM **re-tokenizes from the raw messages**, ignoring
-    ``input_ids``.  This is required for multimodal inputs (the Completions
-    API cannot carry image/video/audio references), but harmful for text-only
-    data: preprocessing truncates ``input_ids`` to ``seq_length``, yet the
-    ``messages`` column stores the original un-truncated conversation.
-    Re-tokenizing those messages produces a longer sequence that can exceed
-    ``max_model_len``.
-
-    We therefore only forward ``messages`` when the conversation actually
-    contains multimodal content.  Text-only conversations always go through
-    the Completions API with the pre-truncated ``input_ids``.
-
-    This matters for models like Qwen3.5-0.8B whose ``AutoProcessor`` returns
-    a ``ProcessorMixin`` (``Qwen3VLProcessor``), causing preprocessing to
-    populate the ``messages`` column even for purely text-only datasets.
-    Text-only EAGLE-3 models (e.g. Llama) use a plain tokenizer, so
-    ``messages`` is never created and this guard is a no-op.
-    """
-    out_dict: dict = {"input_ids": dataset_item["input_ids"].tolist()}
-
-    if "messages" in dataset_item and _has_multimodal_content(dataset_item["messages"]):
-        out_dict["messages"] = dataset_item["messages"]
-
-    return cast("ClientItem", out_dict)
 
 
 class BaseDataset(Dataset):
@@ -159,7 +112,7 @@ class BaseDataset(Dataset):
         self,
         max_len: int,
         transform: TransformTensors | None = None,
-        hidden_states_dtype=torch.bfloat16,
+        hidden_states_dtype=torch.float,
     ):
         self.max_len = max_len
         self.transform = transform
@@ -215,17 +168,6 @@ class BaseDataset(Dataset):
         return data
 
 
-def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
-    lock_path = str(file_path) + ".lock"
-    if Path(lock_path).exists():
-        wait_for_lock(lock_path)
-
-    if file_path.exists():
-        return load_file(file_path)
-
-    return None
-
-
 class ArrowDataset(BaseDataset):
     def __init__(
         self,
@@ -237,10 +179,13 @@ class ArrowDataset(BaseDataset):
         on_generate: Literal["cache", "delete"] = "delete",
         split_ratio: float = 1.0,
         transform: TransformTensors | None = None,
-        hidden_states_dtype=torch.bfloat16,
+        hidden_states_dtype=torch.float,
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        engine: object | None = None,
+        seed: int = 42,
+        defer_generation: bool = False,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -251,7 +196,6 @@ class ArrowDataset(BaseDataset):
             hidden_states_dtype: The dtype of the hidden states.
         """
         self.data = load_from_disk(datapath)
-        self.start_file_idx = 0
         if split_ratio == 1.0:
             pass
         elif 1.0 > split_ratio > 0:
@@ -277,6 +221,9 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.engine = engine
+        self.seed = seed
+        self.defer_generation = defer_generation
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -294,7 +241,7 @@ class ArrowDataset(BaseDataset):
         if self.model and self.model != model_id:
             raise ValueError(
                 f"An explicit model name was passed ({self.model}) which doesn't match"
-                f" found model_id {model_id}."
+                "found model_id {model_id}."
                 "Please make sure --endpoint is set to the correct vllm instance."
             )
         self.model = model_id
@@ -302,54 +249,65 @@ class ArrowDataset(BaseDataset):
     def __len__(self):
         return len(self.data)
 
+    def __getitem__(self, index):
+        if getattr(self, "defer_generation", False):
+            item = self.data[index]
+            ids = torch.as_tensor(item["input_ids"], dtype=torch.long)
+            lm = torch.as_tensor(item["loss_mask"])
+            seq = int(ids.shape[0])
+            return {
+                "input_ids": ids,
+                "loss_mask": lm,
+                "lengths": torch.tensor([seq], dtype=torch.long),
+            }
+        return super().__getitem__(index)
+
     def _compute_approx_lengths(self) -> list[int]:
         """Get lengths of the dataset samples."""
         return list(self.data.with_format(None)["seq_len"])
 
+    def _maybe_load_hs_file(self, index: int) -> dict[str, torch.Tensor] | None:
+        file_idx = self._map_to_file_idx(index)
+        candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+        if candidate_path.exists():
+            return load_file(candidate_path)
+
+        return None
+
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
-        if not self.client:
+        if self.engine is None and not self.client:
             self._setup_client()
 
-        dataset_item = self.data[index]
-        client_item = build_client_item(dataset_item)
-
+        input_ids = self.data[index]["input_ids"].tolist()
         try:
-            hs_filepath = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
-
-            loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
-            if loaded_hs is None:
-                raise ValueError(f"Failed to load hidden states from {hs_filepath}")
-
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
-
-            match self.on_generate:
-                case "cache":
-                    file_idx = self._map_to_file_idx(index)
-                    target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-                    shutil.move(hs_filepath, target_path)
-                case "delete":
-                    Path(hs_filepath).unlink()
-        except Exception as e:
-            if isinstance(e, ValueError) and "NaN" in str(e):
-                raise
-            warnings.warn(
-                f"Failed to load/cache hidden states for sample {index}: {e}",
-                stacklevel=1,
-            )
+            if self.engine is not None:
+                hs_filepath = generate_hidden_states_inprocess(self.engine, {"input_ids": input_ids}, seed=self.seed)
+            else:
+                hs_filepath = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    input_ids,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
+        except Exception as e:  # noqa: BLE001
+            warnings.warn(str(e), stacklevel=1)
             return None
+
+        loaded_hs = load_file(hs_filepath)
+
+        match self.on_generate:
+            case "cache":
+                file_idx = self._map_to_file_idx(index)
+                target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+                shutil.move(hs_filepath, target_path)
+            case "delete":
+                Path(hs_filepath).unlink()
 
         return loaded_hs
 
     def _get_raw_data(self, index):
-        file_idx = self._map_to_file_idx(index)
-        candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        loaded_hs = _maybe_load_hs_file(candidate_path)
+        loaded_hs = self._maybe_load_hs_file(index)
 
         if loaded_hs is None:
             match self.on_missing:
@@ -372,7 +330,7 @@ class ArrowDataset(BaseDataset):
             return loaded_hs
 
         # loaded_hs structure: {
-        #   "hidden_states": [seq_len, num_layers, hidden_size]
+        #   "hidden_states": [seq_len, 4, hidden_size]
         #   "token_ids": [seq_len]
         # }
 
@@ -403,7 +361,7 @@ class SampleFileDataset(BaseDataset):
         datapath: str | None = None,
         file_list: list[str] | None = None,
         transform: TransformTensors | None = None,
-        hidden_states_dtype: torch.dtype = torch.bfloat16,
+        hidden_states_dtype=None,
     ):
         """Initialize the SampleFileDataset.
         Args:
@@ -496,8 +454,6 @@ class SampleFileDataset(BaseDataset):
 def create_collate_fn(
     max_len: int,
     hidden_size: int,
-    num_target_layers: int = 3,
-    dtype: torch.dtype = torch.bfloat16,
     preprocess: Callable[[BatchType], BatchType] | None = None,
 ):
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
@@ -506,14 +462,8 @@ def create_collate_fn(
 
         if not batch:
             # Create empty sample which then gets padded to full
-            # batch size if no valid samples are found.
-            # Match the configured `dtype` so the placeholder doesn't crash
-            # downstream layers loaded at a different precision (e.g. bf16
-            # weights vs fp32 default placeholders).
-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
-            if preprocess:
-                empty = preprocess(empty)
-            batch = [empty]
+            # batch size if no valid samples are found
+            batch = [create_empty_sample(hidden_size)]
 
         collated_data = {}
         for key in batch[0]:  # type: ignore[union-attr]
@@ -531,7 +481,7 @@ def create_collate_fn(
         # Include lengths until while they fit in max_len
         # The last included length is (if necessary) truncated
         # Any additional lengths are discarded
-        lengths = collated_data.pop("lengths")
+        lengths = collated_data["lengths"]
         new_lengths = []
         cum_length = 0
         for length in lengths:
@@ -540,21 +490,7 @@ def create_collate_fn(
                 break
             new_lengths.append(length)
             cum_length += length
-        lengths = torch.tensor(new_lengths, dtype=torch.long)
-
-        # Create document_ids: maps each position to its document index, -1 for padding
-        document_ids = torch.repeat_interleave(
-            torch.arange(lengths.shape[0], dtype=torch.long), lengths
-        )
-        document_ids = torch.cat(
-            [
-                document_ids,
-                -1 * torch.ones(max_len - document_ids.shape[0], dtype=torch.long),
-            ]
-        ).unsqueeze(0)
-        # shape: [1, max_len]
-        collated_data["document_ids"] = document_ids
-
+        collated_data["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
         return collated_data
 
     return collate_fn

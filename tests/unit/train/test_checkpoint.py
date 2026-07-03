@@ -1,5 +1,3 @@
-import os
-import signal
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +18,6 @@ def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool)
         save_path=str(tmp_path),
         resume_from_checkpoint=False,
         is_distributed=False,
-        rank=0,
         local_rank=0,
         checkpoint_freq=checkpoint_freq,
         save_best=save_best,
@@ -29,7 +26,6 @@ def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool)
     trainer.current_epoch = 0
     trainer.global_step = 0
     trainer.is_distributed = False
-    trainer.rank = 0
     trainer.local_rank = 0
     trainer.resume_from_checkpoint = False
     trainer.train_loader = cast("DataLoader[Any]", [])
@@ -37,8 +33,8 @@ def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool)
     trainer.checkpointer = SingleGPUCheckpointer(str(tmp_path))
 
     trainer.model = cast("SpeculatorModel", object())
-    trainer.optimizers = cast("list[torch.optim.Optimizer]", [object()])
-    trainer.schedulers = []
+    trainer.opt = cast("torch.optim.AdamW", object())
+    trainer.scheduler = None
     return trainer
 
 
@@ -242,7 +238,6 @@ def test_best_val_loss_restored_on_resume(tmp_path: Path):
     trainer = Trainer.__new__(Trainer)
     trainer.resume_from_checkpoint = True
     trainer.is_distributed = False
-    trainer.rank = 0
     trainer.local_rank = 0
     trainer.checkpointer = cp
 
@@ -256,38 +251,3 @@ def test_best_val_loss_restored_on_resume(tmp_path: Path):
         trainer.best_val_loss = saved
 
     assert trainer.best_val_loss == pytest.approx(0.42)
-
-
-def test_graceful_shutdown_saves_interrupted_checkpoint(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
-    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=99, save_best=False)
-    trainer.config = trainer.config._replace(num_epochs=4)
-
-    saved_labels: list[int | str] = []
-
-    def fake_train_epoch(epoch: int):
-        if epoch == 2:
-            os.kill(os.getpid(), signal.SIGINT)
-
-    def fake_val_epoch(epoch: int):
-        return {"loss_epoch": 0.5}
-
-    def fake_cp_save_checkpoint(_model, _opt, epoch: int | str):
-        saved_labels.append(epoch)
-        (tmp_path / str(epoch)).mkdir(exist_ok=True)
-
-    trainer.train_epoch = fake_train_epoch
-    trainer.val_epoch = fake_val_epoch
-    monkeypatch.setattr(
-        trainer.checkpointer, "save_checkpoint", fake_cp_save_checkpoint
-    )
-    monkeypatch.setattr(
-        trainer.checkpointer,
-        "save_scheduler_state_dict",
-        lambda *_args, **_kwargs: None,
-    )
-
-    trainer.run_training()
-
-    assert "interrupted" in saved_labels

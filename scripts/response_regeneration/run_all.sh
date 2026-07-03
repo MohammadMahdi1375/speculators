@@ -20,8 +20,6 @@ PORT=8000
 MODEL=""
 DP_SIZE=""
 TP_SIZE=""
-MAX_MODEL_LEN=""
-REASONING_PARSER=""
 GPUS=""
 KEEP_SERVER=false
 
@@ -39,14 +37,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tp-size)
             TP_SIZE="$2"
-            shift 2
-            ;;
-        --max-model-len)
-            MAX_MODEL_LEN="$2"
-            shift 2
-            ;;
-        --reasoning-parser)
-            REASONING_PARSER="$2"
             shift 2
             ;;
         --model)
@@ -77,7 +67,7 @@ done
 # Validate required arguments
 if [ -z "$MODEL" ]; then
     echo "Error: --model is required."
-    echo "Usage: $0 --model MODEL [--gpus GPUS] [--dp-size N] [--tp-size N] [--max-model-len N] [--reasoning-parser PARSER] [--dataset DATASET] [...]"
+    echo "Usage: $0 --model MODEL [--gpus GPUS] [--dp-size N] [--tp-size N] [--dataset DATASET] [...]"
     exit 1
 fi
 
@@ -85,8 +75,6 @@ fi
 VLLM_CMD=(vllm serve "$MODEL" --host 127.0.0.1 --port "$PORT" --api-key "")
 [ -n "$DP_SIZE" ] && VLLM_CMD+=(--data-parallel-size "$DP_SIZE")
 [ -n "$TP_SIZE" ] && VLLM_CMD+=(--tensor-parallel-size "$TP_SIZE")
-[ -n "$MAX_MODEL_LEN" ] && VLLM_CMD+=(--max-model-len "$MAX_MODEL_LEN")
-[ -n "$REASONING_PARSER" ] && VLLM_CMD+=(--reasoning-parser "$REASONING_PARSER")
 
 # Cleanup function
 cleanup() {
@@ -112,8 +100,6 @@ echo "  Model: $MODEL"
 [ -n "$GPUS" ] && echo "  GPUs: $GPUS"
 [ -n "$DP_SIZE" ] && echo "  Data parallel size: $DP_SIZE"
 [ -n "$TP_SIZE" ] && echo "  Tensor parallel size: $TP_SIZE"
-[ -n "$MAX_MODEL_LEN" ] && echo "  Max model len: $MAX_MODEL_LEN"
-[ -n "$REASONING_PARSER" ] && echo "  Reasoning parser: $REASONING_PARSER"
 echo "  Command: ${VLLM_CMD[*]}"
 echo ""
 

@@ -1,7 +1,5 @@
-import json
 import logging
 import warnings
-from pathlib import Path
 from typing import Literal, NamedTuple
 
 import torch
@@ -24,15 +22,12 @@ from speculators.train.checkpointer import (
     DistributedCheckpointer,
     SingleGPUCheckpointer,
 )
-from speculators.train.graceful_shutdown import with_graceful_shutdown
-from speculators.train.optimizers import build_optimizers
-from speculators.train.utils import apply_fully_sharded, normalize_counted_metrics
+from speculators.train.utils import apply_fully_sharded
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
-MIN_STEP_PCT = 0.25
 
 
 class TrainerConfig(NamedTuple):
@@ -42,21 +37,14 @@ class TrainerConfig(NamedTuple):
     resume_from_checkpoint: bool = False
     is_distributed: bool = False
     local_rank: int = 0
-    rank: int = 0
     train_call_kwargs: dict = {}
     val_call_kwargs: dict = {}
-    optimizer: Literal["adamw", "muon"] = "adamw"
-    weight_decay: float = 0.01
-    muon_lr: float = 0.02
-    muon_momentum: float = 0.95
-    muon_weight_decay: float = 0.1
-    muon_ns_steps: int = 5
-    muon_adjust_lr_fn: str = "match_rms_adamw"
     scheduler_type: Literal["linear", "cosine", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
-    checkpoint_freq: float = 1
+    checkpoint_freq: int = 1
+    save_steps: int = 0
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -73,7 +61,6 @@ class Trainer:
         self.model = model
         self.config = config
         self.local_rank = config.local_rank
-        self.rank = config.rank
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.is_distributed = config.is_distributed
@@ -86,64 +73,22 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
-
-    def _training_state_path(self, epoch: int) -> Path:
-        return self.checkpointer.path / str(epoch) / "training_state.json"
-
-    def _save_training_state(self, epoch: int, local_step: int) -> None:
-        if not self.is_distributed or dist.get_rank() == 0:
-            state = {
-                "epoch": epoch,
-                "local_step": local_step,
-                "global_step": self.global_step,
-            }
-            p = self._training_state_path(epoch)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(state))
-
-    def _load_training_state(self) -> dict:
-        epoch = self.checkpointer.previous_epoch
-        p = self._training_state_path(epoch)
-        if p.exists():
-            try:
-                return json.loads(p.read_text())
-            except json.JSONDecodeError as e:
-                root_logger.warning(f"Failed to decode training state {p}: {e}")
-            except (FileNotFoundError, PermissionError, OSError) as e:
-                root_logger.warning(f"Failed to read training state {p}: {e}")
-        return {}
+        self.tp_gather = self._detect_tp_gather()
+        if self.tp_gather:
+            self.train_loader.dataset.defer_generation = True
+            if self.val_loader is not None:
+                self.val_loader.dataset.defer_generation = True
+        if self.local_rank == 0:
+            root_logger.info(
+                f"[trainer] TP gather/scatter = {'ON' if self.tp_gather else 'OFF'}"
+            )
 
     def setup_trainer(self):
         if self.checkpointer.previous_epoch != -1:
             root_logger.info(f"Found checkpoint at {self.checkpointer.prev_path}.")
             self.current_epoch = self.checkpointer.previous_epoch + 1
             if self.resume_from_checkpoint:
-                # Check if this was a mid-epoch checkpoint — if so, resume
-                # from within that epoch rather than jumping to the next one.
-                state = self._load_training_state()
-                is_mid_epoch = (
-                    state
-                    and state.get("epoch") == self.checkpointer.previous_epoch
-                    and state.get("local_step", 0) > 0  # 0 means end-of-epoch
-                )
-                if is_mid_epoch:
-                    # Resume within the same epoch from the exact step.
-                    self.current_epoch = state["epoch"]
-                    self._resume_local_step = state["local_step"]
-                    self._resume_global_step = state.get("global_step", 0)
-                    root_logger.info(
-                        f"Resuming mid-epoch from epoch={self.current_epoch} "
-                        f"local_step={self._resume_local_step} "
-                        f"global_step={self._resume_global_step}."
-                    )
-                else:
-                    # End-of-epoch or no state — advance to next epoch.
-                    self._resume_local_step = 0
-                    resume_global = state.get("global_step", 0) if state else 0
-                    self._resume_global_step = resume_global
-                    root_logger.info(
-                        f"Resuming training on epoch {self.current_epoch}."
-                    )
+                root_logger.info(f"Resuming training on {self.current_epoch} epoch.")
             else:
                 root_logger.warning(
                     "`resume_from_checkpoint` is False, starting "
@@ -151,17 +96,10 @@ class Trainer:
                     f"existing checkpoints in {self.checkpointer.path}."
                 )
                 self.current_epoch = 0
-                self._resume_local_step = 0
-                self._resume_global_step = 0
         else:
-            root_logger.info(
-                "No previous training checkpoint found in "
-                f"'{self.checkpointer.path}'. Starting fresh training run."
-            )
+            root_logger.info("No previous checkpoint found. Starting from scratch.")
             self.current_epoch = 0
-            self._resume_local_step = 0
-            self._resume_global_step = 0
-        self.global_step = self._resume_global_step
+        self.global_step = 0
         self.best_val_loss = float("inf")
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
@@ -189,42 +127,29 @@ class Trainer:
             return
 
         # Distributed case
-        # Capture full state dict on rank 0 before FSDP sharding
-        full_state_dict = {}
-        if not load_checkpoint and dist.get_rank() == 0:
-            full_state_dict = self.model.state_dict()
-
+        #
+        # Fresh scratch training: avoid the rank-0 full-state broadcast.
+        # In the 2-node co-located DSV4 run, this Gloo object-broadcast
+        # path can fail as 'Connection closed by peer'. All ranks are
+        # re-seeded before draft model initialization in scripts/train.py.
         apply_fully_sharded(self.model)
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
-        else:
-            # Broadcast full state dict from rank 0 to all ranks
-            set_model_state_dict(
-                self.model,
-                full_state_dict,
-                options=StateDictOptions(
-                    full_state_dict=True,
-                    broadcast_from_rank0=True,
-                    strict=False,
-                ),
-            )
-            del full_state_dict
-            dist.barrier()
+
+        dist.barrier()
 
     def setup_optimizer(self):
-        # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
-        # 2D weight matrices, AdamW for everything else); "adamw" returns a single one.
-        self.optimizers = build_optimizers(self.model, self.config)
+        # Setup optimizer
+        self.opt = torch.optim.AdamW(self.model.named_parameters(), lr=self.config.lr)
         last_epoch = -1
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
-            self.checkpointer.load_optimizer_state_dict(self.model, self.optimizers)
+            self.checkpointer.load_optimizer_state_dict(self.model, self.opt)
             last_epoch = self.checkpointer.previous_epoch
 
-        # Setup scheduler(s) — one per optimizer so each optimizer's base LR (e.g.
-        # Muon's higher LR vs AdamW's) is warmed up / decayed independently.
+        # Setup scheduler
         if self.config.scheduler_type == "none":
-            self.schedulers: list[torch.optim.lr_scheduler.LRScheduler] = []
+            self.scheduler = None
             return
 
         # Compute defaults if None
@@ -236,96 +161,37 @@ class Trainer:
             self.config.num_epochs * len(self.train_loader)
         )
 
-        def make_scheduler(opt: torch.optim.Optimizer):
-            if self.config.scheduler_type == "linear":
-                return get_linear_schedule_with_warmup(
-                    opt,
-                    num_warmup_steps=scheduler_warmup_steps,
-                    num_training_steps=scheduler_total_steps,
-                    last_epoch=last_epoch,
-                )
-            return get_cosine_schedule_with_warmup(
-                opt,
+        if self.config.scheduler_type == "linear":
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.opt,
+                num_warmup_steps=scheduler_warmup_steps,
+                num_training_steps=scheduler_total_steps,
+                last_epoch=last_epoch,
+            )
+        else:
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.opt,
                 num_warmup_steps=scheduler_warmup_steps,
                 num_training_steps=scheduler_total_steps,
                 num_cycles=self.config.scheduler_num_cosine_cycles,
                 last_epoch=last_epoch,
             )
 
-        self.schedulers = [make_scheduler(opt) for opt in self.optimizers]
-
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
-            self.checkpointer.load_scheduler_state_dict(self.schedulers)
-
-    def _optimizers_zero_grad(self):
-        for opt in self.optimizers:
-            opt.zero_grad()
-
-    def _optimizers_step(self):
-        for opt in self.optimizers:
-            opt.step()
-
-    def _schedulers_step(self):
-        for scheduler in self.schedulers:
-            scheduler.step()
-
-    def _prepare_resume_skip(self, epoch: int) -> int:
-        """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
-        skip_steps = 0
-        if epoch == getattr(self, "current_epoch", epoch):
-            skip_steps = getattr(self, "_resume_local_step", 0)
-            # Only skip once — clear after use.
-            self._resume_local_step = 0
-
-        # Fast-skip: slice the sampler's pre-generated batch list so we never
-        # call __getitem__ (and thus never call vLLM) for skipped batches.
-        sampler = self.train_loader.batch_sampler
-        has_fast_skip_api = hasattr(sampler, "_generate_batches") and hasattr(
-            sampler, "_cached_generated_batches"
-        )
-        if skip_steps > 0 and has_fast_skip_api:
-            all_batches = sampler._generate_batches(epoch)  # type: ignore[union-attr]  # noqa: SLF001
-            remaining = all_batches[skip_steps:]
-            # Temporarily override the sampler cache with the sliced list.
-            sampler._cached_generated_batches = (  # type: ignore[union-attr]  # noqa: SLF001
-                epoch,
-                remaining,
-            )
-            root_logger.info(
-                f"Fast-skipping {skip_steps} batches via sampler slice "
-                f"(no vLLM calls for skipped batches). "
-                f"epoch={epoch}, global_step={self.global_step}."
-            )
-        elif skip_steps > 0:
-            root_logger.warning(
-                "Sampler lacks fast-skip API; resume will replay "
-                f"{skip_steps} batches from the start of the epoch."
-            )
-        return skip_steps
+            self.checkpointer.load_scheduler_state_dict(self.scheduler)
 
     def train_epoch(self, epoch: int):
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
             self.train_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
 
-        # Capture full-epoch step count before any resume fast-skip mutation.
-        num_steps = len(self.train_loader)
-
-        # Determine how many batches to skip for mid-epoch resume.
-        skip_steps = self._prepare_resume_skip(epoch)
-
         train_loader = self.train_loader
-        if self.rank == 0:
+        if self.local_rank == 0:
             train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
-        step_interval = (
-            max(1, round(num_steps * self.config.checkpoint_freq))
-            if self.config.checkpoint_freq < 1
-            else None
-        )
-        for local_step_rel, batch in enumerate(train_loader, 1):
-            # local_step is 1-based index into the *full* epoch (not the slice).
-            local_step = local_step_rel + skip_steps
+        for batch in train_loader:
+            if self.tp_gather:
+                batch = self._tp_gather_generate_scatter(batch)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -337,48 +203,185 @@ class Trainer:
                 **gpu_batch, **self.config.train_call_kwargs
             )
 
-            self._optimizers_zero_grad()
+            self.opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self._optimizers_step()
+            self.opt.step()
 
-            current_lrs = {
-                type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
-            }
-            self._schedulers_step()
+            current_lr = self.opt.param_groups[0]["lr"]
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            # Save a checkpoint every N optimizer steps (0 disables).
+            _save_steps = getattr(self.config, "save_steps", 0)
+            if _save_steps and self.global_step > 0 and self.global_step % _save_steps == 0:
+                if (not self.is_distributed) or self.local_rank == 0:
+                    root_logger.info(
+                        f"Saving step checkpoint at global_step={self.global_step}"
+                    )
+                self.checkpointer.save_checkpoint(self.model, self.opt, self.global_step)
+                if self.scheduler is not None:
+                    self.checkpointer.save_scheduler_state_dict(
+                        self.scheduler, self.global_step
+                    )
 
             if self.global_step % self.config.log_freq == 0:
                 if self.is_distributed:
                     for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                        dist.reduce(v, dst=0, op=dist.ReduceOp.AVG)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
-                world_size = dist.get_world_size() if self.is_distributed else 1
-                metrics = normalize_counted_metrics(metrics, world_size)
-                lr_info = (
-                    current_lrs
-                    if len(current_lrs) > 1
-                    else next(iter(current_lrs.values()))
-                )
                 metric_logger.info(
                     {
                         "train": metrics,
                         "epoch": epoch,
-                        "lr": lr_info,
+                        "lr": current_lr,
                         "global_step": self.global_step,
                     },
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
 
-            if (
-                step_interval is not None
-                and not self.config.save_best
-                and local_step % step_interval == 0
-                and num_steps - local_step >= step_interval * MIN_STEP_PCT
-                # Avoid saving back to back ay the end of each epoch
-            ):
-                self.maybe_save_checkpoint(epoch, local_step=local_step)
+    def _detect_tp_gather(self) -> bool:
+        import os as _os
+        forced = _os.environ.get("DFLASH_TP_GATHER")
+        if forced is not None:
+            return forced not in ("", "0", "false", "False", "no")
+        try:
+            engine = getattr(self.train_loader.dataset, "engine", None)
+            if engine is None:
+                return False
+            tp = engine.llm_engine.vllm_config.parallel_config.tensor_parallel_size
+            return int(tp) > 1
+        except Exception:
+            return False
+
+    def _tp_gather_generate_scatter(self, batch):
+        import os as _os
+        import time as _time
+        from safetensors.torch import load_file
+        from vllm import SamplingParams
+
+        dataset = self.train_loader.dataset
+        engine = dataset.engine
+        seed = getattr(dataset, "seed", 42)
+        hsd = self.config.hidden_states_dtype
+        transform = getattr(dataset, "transform", None)
+        collate = self.train_loader.collate_fn
+
+        lengths = [int(x) for x in batch["lengths"].tolist()]
+        ids_flat = batch["input_ids"].reshape(-1)
+        lm_flat = batch["loss_mask"].reshape(-1)
+
+        local_tokens, local_lossmask = [], []
+        off = 0
+        for L in lengths:
+            local_tokens.append([int(t) for t in ids_flat[off:off + L].tolist()])
+            local_lossmask.append(lm_flat[off:off + L].clone())
+            off += L
+
+        world = dist.get_world_size()
+        gathered = [None] * world
+        dist.all_gather_object(gathered, local_tokens)
+
+        counts = [len(gathered[r]) for r in range(world)]
+        global_tokens = [t for r in range(world) for t in gathered[r]]
+
+        my_rank = dist.get_rank()
+        my_offset = sum(counts[:my_rank])
+        my_count = counts[my_rank]
+
+        prompts = [{"prompt_token_ids": t} for t in global_tokens]
+        sp = SamplingParams(max_tokens=1, temperature=0.0, seed=seed)
+
+        outs = engine.generate(prompts, sp, use_tqdm=False) if prompts else []
+
+        # Important:
+        # Every rank calls engine.generate() with the full global prompt list.
+        # On each node, that can create local hidden-state files for all prompts.
+        # We must delete all paths returned by this local generate() call, not only
+        # this rank's my_outs slice, otherwise /dev/shm/hidden_states grows forever.
+        all_out_paths = []
+        for o in outs:
+            kvp = getattr(o, "kv_transfer_params", None)
+            path = kvp.get("hidden_states_path") if isinstance(kvp, dict) else None
+            if path:
+                all_out_paths.append(path)
+
+        my_outs = outs[my_offset:my_offset + my_count]
+
+        samples = []
+        for j, o in enumerate(my_outs):
+            kvp = getattr(o, "kv_transfer_params", None)
+            path = kvp.get("hidden_states_path") if isinstance(kvp, dict) else None
+            if not path:
+                raise RuntimeError(f"Missing hidden_states_path in kv_transfer_params: {kvp}")
+
+            # The hidden-state connector writes to /dev/shm. Wait briefly for the
+            # file to become visible before loading.
+            for _attempt in range(200):
+                if _os.path.exists(path):
+                    break
+                _time.sleep(0.05)
+            else:
+                parent = _os.path.dirname(path)
+                try:
+                    existing = sorted(_os.listdir(parent))[:30]
+                except Exception as exc:
+                    existing = [f"<could not list {parent}: {exc}>"]
+                raise FileNotFoundError(
+                    f"Hidden-state file was not found before load: {path}. "
+                    f"First files in directory: {existing}"
+                )
+
+            loaded = load_file(path)
+            hs = loaded["hidden_states"]
+            seq = int(loaded["token_ids"].shape[0])
+
+            sample = {
+                "hidden_states": hs.flatten(1).to(hsd),
+                "input_ids": loaded["token_ids"],
+                "verifier_last_hidden_states": hs[:, -1].to(hsd),
+                "loss_mask": local_lossmask[j],
+                "lengths": torch.tensor([seq], dtype=torch.long),
+                "position_ids": torch.arange(seq, dtype=torch.long),
+            }
+
+            if transform:
+                sample = transform(sample)
+
+            samples.append(sample)
+
+        # All ranks must finish loading their own slice before any rank deletes
+        # generated hidden-state files. This avoids the previous FileNotFoundError.
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Delete all files created by this rank's local engine.generate() call.
+        # Multiple ranks on the same node may try to delete the same files; that is
+        # fine because FileNotFoundError is ignored.
+        if getattr(self.config, "on_generate", "delete") == "delete":
+            deleted = 0
+            for path in all_out_paths:
+                try:
+                    if path and _os.path.exists(path):
+                        _os.remove(path)
+                        deleted += 1
+                except FileNotFoundError:
+                    pass
+
+            if _os.environ.get("DFLASH_HS_DEBUG", "0") == "1":
+                print(
+                    f"[DFLASH_HS_CLEANUP] rank={my_rank} "
+                    f"my_count={my_count} outs={len(outs)} "
+                    f"all_out_paths={len(all_out_paths)} deleted={deleted}",
+                    flush=True,
+                )
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        return collate(samples)
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
@@ -388,12 +391,14 @@ class Trainer:
         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
             self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
         val_loader = self.val_loader
-        if self.rank == 0:
+        if self.local_rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
         val_metrics: dict[str, float] = {}
         num_batches = len(val_loader)
         for batch in val_loader:
+            if self.tp_gather:
+                batch = self._tp_gather_generate_scatter(batch)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -407,90 +412,75 @@ class Trainer:
 
             if self.is_distributed:
                 for m in metrics.values():
-                    dist.all_reduce(m, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(m, op=dist.ReduceOp.AVG)
 
             for k, v in metrics.items():
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
 
-        world_size = dist.get_world_size() if self.is_distributed else 1
-        val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
-        val_metrics = normalize_counted_metrics(val_metrics, world_size)
-        val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
-
+        val_metrics = {f"{k}_epoch": v / num_batches for k, v in val_metrics.items()}
         metric_logger.info(
             {"val": val_metrics, "epoch": epoch}, extra={"step": self.global_step}
         )
-
         return val_metrics
 
-    def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
-        if epoch != "interrupted" and (
+    def maybe_save_checkpoint(self, epoch: int, val_metrics: dict | None):
+        if (
             self.config.save_best
-            or (
-                self.config.checkpoint_freq >= 1
-                and isinstance(epoch, int)
-                and epoch != 0
-                and (epoch + 1) % self.config.checkpoint_freq != 0
+            and val_metrics is not None
+            and "loss_epoch" in val_metrics
+        ):
+            if val_metrics["loss_epoch"] < self.best_val_loss:
+                self.best_val_loss = val_metrics["loss_epoch"]
+                root_logger.info(
+                    f"Saving new best checkpoint at epoch {epoch} "
+                    f"(loss_epoch={self.best_val_loss:.6f})"
+                )
+                self.checkpointer.save_checkpoint(self.model, self.opt, epoch)
+                if self.scheduler is not None:
+                    self.checkpointer.save_scheduler_state_dict(self.scheduler, epoch)
+                self.checkpointer.save_val_metrics(epoch, val_metrics)
+                self.checkpointer.update_best_symlink(epoch)
+                root_logger.info(
+                    f"Updated checkpoint_best -> {epoch} "
+                    f"(loss_epoch={self.best_val_loss:.6f})"
+                )
+                # Keep ONLY the best checkpoint folder + best_checkpoint symlink
+                self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
+
+        elif epoch == 0 or (epoch + 1) % self.config.checkpoint_freq == 0:
+            root_logger.info(
+                f"Saving checkpoint to {self.checkpointer.path / str(epoch)}"
             )
-        ):
-            return
+            self.checkpointer.save_checkpoint(self.model, self.opt, epoch)
+            if self.scheduler is not None:
+                self.checkpointer.save_scheduler_state_dict(self.scheduler, epoch)
+            if val_metrics is not None:
+                self.checkpointer.save_val_metrics(epoch, val_metrics)
+            root_logger.info(
+                f"Checkpoint saved to {self.checkpointer.path / str(epoch)}"
+            )
+            if (
+                val_metrics is not None
+                and "loss_epoch" in val_metrics
+                and val_metrics["loss_epoch"] < self.best_val_loss
+            ):
+                self.best_val_loss = val_metrics["loss_epoch"]
+                root_logger.info(
+                    f"Updating new best checkpoint symlink at epoch {epoch} "
+                    f"(loss_epoch={self.best_val_loss:.6f})"
+                )
+                self.checkpointer.update_best_symlink(epoch)
+                root_logger.info(
+                    f"Updated checkpoint_best -> {epoch} "
+                    f"(loss_epoch={self.best_val_loss:.6f})"
+                )
 
-        root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(epoch)}")
-        self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
-        if self.schedulers:
-            self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
-        if isinstance(epoch, int):
-            self._save_training_state(epoch, local_step)
-            # Create a human-readable symlink for checkpoint readability.
-            # e.g. epoch0_step16626 -> 0/ (mid) or epoch0_end -> 0/ (end)
-            if not self.is_distributed or dist.get_rank() == 0:
-                ckpt_dir = self.checkpointer.path
-                suffix = f"step{local_step}" if local_step > 0 else "end"
-                link_name = ckpt_dir / f"epoch{epoch}_{suffix}"
-                target = Path(str(epoch))  # relative symlink
-                # Remove any previous link for this epoch
-                for old in ckpt_dir.glob(f"epoch{epoch}_*"):
-                    if old.is_symlink():
-                        old.unlink()
-                link_name.symlink_to(target)
-        root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
-
-    def maybe_update_best(self, epoch: int, val_metrics: dict | None):
-        if val_metrics is None or "loss_epoch" not in val_metrics:
-            return
-        if val_metrics["loss_epoch"] >= self.best_val_loss:
-            return
-
-        if self.config.save_best:
-            self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
-            if self.schedulers:
-                self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
-        elif self.config.checkpoint_freq >= 1 and not (
-            epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0
-        ):
-            return
-
-        self.best_val_loss = val_metrics["loss_epoch"]
-        self.checkpointer.save_val_metrics(epoch, val_metrics)
-        self.checkpointer.update_best_symlink(epoch)
-        root_logger.info(
-            f"Updated checkpoint_best -> {epoch} (loss_epoch={self.best_val_loss:.6f})"
-        )
-        if self.config.save_best:
-            self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
-
-    @with_graceful_shutdown()
     def run_training(self):
         n_epochs = self.config.num_epochs
         for epoch in range(self.current_epoch, n_epochs):
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
-
-            if self.is_distributed:
-                dist.barrier()
-
-            self.maybe_save_checkpoint(epoch)
 
             if self.is_distributed:
                 dist.barrier()
@@ -507,7 +497,7 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
 
-            self.maybe_update_best(epoch, val_metrics)
+            self.maybe_save_checkpoint(epoch, val_metrics)
 
             if self.is_distributed:
                 dist.barrier()

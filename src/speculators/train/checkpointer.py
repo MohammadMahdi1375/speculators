@@ -1,5 +1,4 @@
 import json
-import logging
 import shutil
 from abc import abstractmethod
 from pathlib import Path
@@ -18,19 +17,6 @@ from torch.distributed.checkpoint.state_dict import (
 from transformers.modeling_utils import PreTrainedModel
 
 from speculators.utils.util import get_current_device
-
-logger = logging.getLogger("speculators")
-
-# Optimizers/schedulers may be a single object (legacy) or a list (e.g. Muon + AdamW).
-OptimizerOrList = torch.optim.Optimizer | list[torch.optim.Optimizer]
-SchedulerOrList = (
-    torch.optim.lr_scheduler.LRScheduler | list[torch.optim.lr_scheduler.LRScheduler]
-)
-
-
-def _as_list(value):
-    """Normalize a single object or a list/tuple of objects into a list."""
-    return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
 class BaseCheckpointer:
@@ -68,34 +54,32 @@ class BaseCheckpointer:
     def load_optimizer_state_dict(
         self,
         model: PreTrainedModel,
-        optimizer: OptimizerOrList,
+        optimizer: torch.optim.Optimizer,
         float_dtype: torch.dtype | None = None,
     ):
         raise NotImplementedError
 
-    def load_scheduler_state_dict(self, scheduler: SchedulerOrList):
+    def load_scheduler_state_dict(
+        self, scheduler: torch.optim.lr_scheduler.LRScheduler
+    ):
         scheduler_path = self.scheduler_path(self.previous_epoch)
         if not scheduler_path.exists():
             return
-        loaded = torch.load(scheduler_path, weights_only=True)
-        schedulers = _as_list(scheduler)
-        loaded_list = loaded if isinstance(loaded, list) else [loaded]
-        for sched, state_dict in zip(schedulers, loaded_list, strict=True):
-            sched.load_state_dict(state_dict)
+        full_state_dict = torch.load(scheduler_path, weights_only=True)
+        scheduler.load_state_dict(full_state_dict)
 
-    def save_scheduler_state_dict(self, scheduler: SchedulerOrList, epoch: int | str):
-        schedulers = _as_list(scheduler)
-        state_dicts = [sched.state_dict() for sched in schedulers]
-        # Preserve the legacy single-scheduler format when there is only one.
-        payload = state_dicts[0] if len(state_dicts) == 1 else state_dicts
-        torch.save(payload, self.scheduler_path(epoch))
+    def save_scheduler_state_dict(
+        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int
+    ):
+        scheduler_path = self.scheduler_path(epoch)
+        torch.save(scheduler.state_dict(), scheduler_path)
 
     @abstractmethod
     def save_checkpoint(
         self,
         model: PreTrainedModel,
-        optimizer: OptimizerOrList,
-        epoch: int | str,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         raise NotImplementedError
@@ -105,31 +89,22 @@ class BaseCheckpointer:
             return -1
         last_checkpoint_num = -1
         for d in self.path.iterdir():
-            if d.is_symlink():
-                continue  # skip descriptive symlinks like epoch0_step16626
             if d.is_dir():
-                if d.name == "interrupted":
-                    logger.warning(
-                        f"Found interrupted checkpoint at {d}. "
-                        "To resume from it, rename it to an epoch number "
-                        "(e.g., 'mv interrupted 5' to resume as epoch 5)."
-                    )
-                    continue
                 try:
                     last_checkpoint_num = max(last_checkpoint_num, int(d.name))
                 except ValueError:
                     continue
         return last_checkpoint_num
 
-    def model_path(self, epoch: int | str):
+    def model_path(self, epoch: int):
         model_fname = "model.safetensors"
         return self.path / str(epoch) / model_fname
 
-    def optimizer_path(self, epoch: int | str):
+    def optimizer_path(self, epoch: int):
         optimizer_fname = "optimizer_state_dict.pt"
         return self.path / str(epoch) / optimizer_fname
 
-    def scheduler_path(self, epoch: int | str):
+    def scheduler_path(self, epoch: int):
         scheduler_fname = "scheduler_state_dict.pt"
         return self.path / str(epoch) / scheduler_fname
 
@@ -258,38 +233,32 @@ class SingleGPUCheckpointer(BaseCheckpointer):
 
     def load_optimizer_state_dict(
         self,
-        model: PreTrainedModel,
-        optimizer: OptimizerOrList,
+        model: PreTrainedModel,  # noqa: ARG002
+        optimizer: torch.optim.Optimizer,
         float_dtype: torch.dtype | None = None,
     ):
         device = get_current_device()
-        loaded = torch.load(
+        full_state_dict = torch.load(
             self.optimizer_path(self.previous_epoch),
             weights_only=True,
             map_location=device,
         )
-        optimizers = _as_list(optimizer)
-        loaded_list = loaded if isinstance(loaded, list) else [loaded]
-        dtype = float_dtype or model.dtype
-        for opt, state_dict in zip(optimizers, loaded_list, strict=True):
-            opt.load_state_dict(convert_float_dtype(state_dict, dtype))
+        full_state_dict = convert_float_dtype(
+            full_state_dict, float_dtype or model.dtype
+        )
+        optimizer.load_state_dict(full_state_dict)
 
     def save_checkpoint(
         self,
         model: PreTrainedModel,
-        optimizer: OptimizerOrList,
-        epoch: int | str,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         model_state_dict = convert_float_dtype(model.state_dict(), float_dtype)
         model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
-        optimizers = _as_list(optimizer)
-        state_dicts = [
-            convert_float_dtype(opt.state_dict(), float_dtype) for opt in optimizers
-        ]
-        # Preserve the legacy single-optimizer format when there is only one.
-        payload = state_dicts[0] if len(state_dicts) == 1 else state_dicts
-        torch.save(payload, self.optimizer_path(epoch))
+        optimizer_state_dict = convert_float_dtype(optimizer.state_dict(), float_dtype)
+        torch.save(optimizer_state_dict, self.optimizer_path(epoch))
 
 
 class DistributedCheckpointer(BaseCheckpointer):
@@ -316,10 +285,9 @@ class DistributedCheckpointer(BaseCheckpointer):
     def load_optimizer_state_dict(
         self,
         model,
-        optimizer: OptimizerOrList,
+        optimizer: torch.optim.Optimizer,
         float_dtype: torch.dtype | None = None,
     ):
-        optimizers = _as_list(optimizer)
         full_state_dict = torch.load(
             self.optimizer_path(self.previous_epoch),
             mmap=True,
@@ -332,24 +300,23 @@ class DistributedCheckpointer(BaseCheckpointer):
 
         set_optimizer_state_dict(
             model,
-            optimizers,
+            optimizer,
             full_state_dict,
             options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
         )
 
         # Cast step counters back to float32
-        for opt in optimizers:
-            for state in opt.state.values():
-                if "step" in state and isinstance(state["step"], torch.Tensor):
-                    state["step"] = state["step"].float()
+        for state in optimizer.state.values():
+            if "step" in state and isinstance(state["step"], torch.Tensor):
+                state["step"] = state["step"].float()
 
         dist.barrier()
 
     def save_checkpoint(
         self,
         model: PreTrainedModel,
-        optimizer: OptimizerOrList,
-        epoch: int | str,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         model_state_dict = get_model_state_dict(
@@ -359,7 +326,7 @@ class DistributedCheckpointer(BaseCheckpointer):
 
         optimizer_state_dict = get_optimizer_state_dict(
             model,
-            _as_list(optimizer),
+            optimizer,
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
         optimizer_state_dict = convert_float_dtype(optimizer_state_dict, float_dtype)
@@ -388,7 +355,9 @@ class DistributedCheckpointer(BaseCheckpointer):
             super().save_val_metrics(epoch, val_metrics)
         dist.barrier()
 
-    def save_scheduler_state_dict(self, scheduler: SchedulerOrList, epoch: int | str):
+    def save_scheduler_state_dict(
+        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int
+    ):
         if dist.get_rank() == 0:
             super().save_scheduler_state_dict(scheduler, epoch)
 

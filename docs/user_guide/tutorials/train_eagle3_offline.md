@@ -2,7 +2,7 @@
 
 This tutorial walks you through training an Eagle-3 speculator model using **offline training**, where hidden states are pre-generated and cached before training begins. This example uses `meta-llama/Llama-3.1-8B-Instruct` as the target model, but the process is the same for other models.
 
-For a ready-to-run version of this tutorial, see [`examples/train/eagle3_llama3_8b_ultrachat_offline_5k.sh`](https://github.com/vllm-project/speculators/blob/main/examples/train/eagle3_llama3_8b_ultrachat_offline_5k.sh).
+For a ready-to-run version of this tutorial, see [`examples/train/eagle3_llama3_8b_sharegpt_offline_5k.sh`](https://github.com/vllm-project/speculators/blob/main/examples/train/eagle3_llama3_8b_sharegpt_offline_5k.sh).
 
 ## Overview
 
@@ -32,7 +32,7 @@ source vllm_venv/bin/activate
 uv pip install "vllm>=0.18"
 ```
 
-Note: if you are using an experiment tracker (e.g. trackio, wandb, tensorboard, mlflow), install it in the speculators venv manually.
+Note: if you are using an experiment tracker (e.g. trackio, wandb, tensorboard), install it in the speculators venv manually.
 
 ## Step 1: Prepare Your Data
 
@@ -152,22 +152,6 @@ output/hidden_states/
 ```bash
 # 8 GPUs with DP=8
 python scripts/launch_vllm.py model -- --data-parallel-size 8
-```
-
-**Use multiple nodes:**
-
-If you have access to multiple machines, each with its own vLLM server, you can split the dataset across them with `--world-size` and `--rank`. Each node generates a contiguous, non-overlapping chunk of the data into a shared (or later merged) output directory. See the [data_generation_offline.py cli reference](/cli/data_generation_offline.md) for details.
-
-```bash
-# On node 0
-python scripts/data_generation_offline.py \
-  --preprocessed-data ./output --output ./output/hidden_states \
-  --max-samples 5000 --world-size 2 --rank 0
-
-# On node 1
-python scripts/data_generation_offline.py \
-  --preprocessed-data ./output --output ./output/hidden_states \
-  --max-samples 5000 --world-size 2 --rank 1
 ```
 
 **Skip validation:**
@@ -361,5 +345,5 @@ After training your model:
 
 1. **Evaluate performance** - See [Evaluating Performance](evaluating_performance.md)
 2. **Deploy to production** - See [Serve in vLLM](serve_vllm.md)
-3. **Fine-tune further** - Use `--from-pretrained ./checkpoints/checkpoint_best` to continue training
+3. **Fine-tune further** - Use `--from-pretrained ./checkpoints/latest` to continue training
 4. **Upload to HuggingFace** - Share your model with the community

@@ -23,7 +23,7 @@ from importlib.metadata import version
 from typing import Any, ClassVar
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from transformers import PretrainedConfig
 
 from speculators.proposals import TokenProposalConfig
@@ -70,28 +70,6 @@ class VerifierConfig(BaseModel):
                 or config_dict.get("name_or_path", None)
             )
 
-        return cls(
-            name_or_path=name_or_path,
-            architectures=config_dict.get("architectures") or [],
-        )
-
-    @classmethod
-    def from_pretrained(cls, name_or_path: str, **kwargs: Any) -> "VerifierConfig":
-        """
-        Create a VerifierConfig by reading the verifier's published config.json.
-
-        Unlike :meth:`from_config`, which extracts fields from an already-loaded
-        ``PretrainedConfig`` object (e.g. a freshly built draft decoder config that
-        has no ``architectures`` set), this reads the verifier's ``config.json``
-        directly so ``architectures`` reflects the real verifier (for example
-        ``["Qwen3ForCausalLM"]``).
-
-        :param name_or_path: The Hugging Face id or local path of the verifier model.
-        :param kwargs: Forwarded to ``PretrainedConfig.get_config_dict`` (e.g.
-            ``cache_dir``, ``revision``).
-        :return: A VerifierConfig with the verifier's name_or_path and architectures.
-        """
-        config_dict, _ = PretrainedConfig.get_config_dict(name_or_path, **kwargs)
         return cls(
             name_or_path=name_or_path,
             architectures=config_dict.get("architectures") or [],
@@ -146,19 +124,6 @@ class SpeculatorsConfig(ReloadableBaseModel):
             "compatibility for a new verifier, if needed."
         ),
     )
-
-    @model_validator(mode="after")
-    def check_default_proposal_method(self) -> "SpeculatorsConfig":
-        """Validate default_proposal_method is one of the proposal_methods."""
-        available = [method.proposal_type for method in self.proposal_methods]
-        if self.default_proposal_method not in available:
-            raise ValueError(
-                "default_proposal_method "
-                f"'{self.default_proposal_method}' must match the proposal_type of "
-                f"one of the configured proposal_methods. Available proposal types: "
-                f"{available}."
-            )
-        return self
 
 
 class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
@@ -362,11 +327,6 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         cls.model_rebuild(force=True, _types_namespace={"torch": torch})
         for subcls in (cls.registry or {}).values():
             subcls.model_rebuild(force=True, _types_namespace={"torch": torch})
-
-    def __iter__(self):
-        # Pydantic's __iter__ yields (key, value) tuples, but transformers
-        # expects string keys. Delegate to PretrainedConfig's __iter__.
-        return PretrainedConfig.__iter__(self)
 
     # transformers >= 5.x adds validate() which conflicts with Pydantic v2's
     # validate() classmethod. Guard so we don't stub it on older transformers.

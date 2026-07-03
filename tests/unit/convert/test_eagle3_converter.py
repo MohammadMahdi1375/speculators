@@ -14,7 +14,9 @@ import pytest
 import torch
 
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
-from speculators.convert.utils import load_checkpoint_config
+from speculators.convert.eagle.utils import (
+    load_checkpoint_config,
+)
 
 
 class TestEagle3ConverterFixes:
@@ -254,19 +256,18 @@ class TestEagle3ConverterFixes:
         """Test that multi-layer conversion support."""
         converter = Eagle3Converter()
 
-        # TODO: Use a real model in the future
+        # TODO: Use a real model in the future  # noqa: FIX002
         checkpoint_path = "nm-testing/testing-llama3.1.8b-2layer-eagle3"
         base_model = "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
 
-        local_checkpoint_path = tmp_path / checkpoint_path.rsplit("/", maxsplit=1)[-1]
         converter.convert(
             checkpoint_path,
-            local_checkpoint_path,
+            tmp_path / checkpoint_path.split("/")[-1],
             base_model,
             norm_before_residual=False,
         )
 
-        config = load_checkpoint_config(local_checkpoint_path)
+        config = load_checkpoint_config(tmp_path / checkpoint_path.split("/")[-1])
 
         # Verify that num_hidden_layers is correctly set to 2
         assert config["transformer_layer_config"]["num_hidden_layers"] == 2

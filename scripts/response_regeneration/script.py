@@ -10,7 +10,6 @@ from typing import Any
 
 import aiohttp
 from datasets import load_dataset
-from tqdm import tqdm
 
 DATASET_CONFIGS = {
     "magpie": {
@@ -22,12 +21,6 @@ DATASET_CONFIGS = {
         "id": "HuggingFaceH4/ultrachat_200k",
         "prompt_field": "prompt",
         "default_split": "train_sft",
-    },
-    "gsm8k": {
-        "id": "openai/gsm8k",
-        "prompt_field": "question",
-        "default_split": "train",
-        "subset": "main",
     },
 }
 
@@ -50,8 +43,8 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         default="ultrachat",
-        choices=list(DATASET_CONFIGS.keys()),
-        help="Dataset to process",
+        choices=["magpie", "ultrachat"],
+        help="Dataset to process (magpie or ultrachat)",
     )
     parser.add_argument(
         "--split",
@@ -61,10 +54,7 @@ def parse_args():
     parser.add_argument(
         "--subset",
         default=None,
-        help=(
-            "Dataset subset/config name "
-            "(auto-detected from dataset config if not specified)"
-        ),
+        help="(unused) kept for symmetry with other scripts",
     )
     parser.add_argument("--limit", type=int, default=None, help="Stop after N rows")
     parser.add_argument(
@@ -141,7 +131,7 @@ async def detect_model(endpoint: str) -> str:
             raise ValueError("No models found at endpoint")
     except ValueError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise ValueError(
             f"Failed to auto-detect model from {models_endpoint}: {e}\n"
             f"Please specify model with --model argument"
@@ -155,8 +145,6 @@ async def worker(
     args,
     out_fh,
     endpoint: str,
-    progress,
-    stats: dict[str, int],
 ):
     """Worker that pulls items from queue and sends them to the vLLM endpoint."""
     while True:
@@ -178,11 +166,8 @@ async def worker(
                 data = await response.json()
 
             choice = data["choices"][0]
-            message = choice["message"]
-            generated_text = message["content"]
-            reasoning_content = message.get("reasoning_content")
-            if reasoning_content is None:
-                reasoning_content = message.get("reasoning")
+            generated_text = choice["message"]["content"]
+            reasoning_content = choice["message"].get("reasoning_content")
             finish_reason = choice.get("finish_reason")
             latency = time.time() - start_time
 
@@ -209,7 +194,6 @@ async def worker(
             }
             out_fh.write(json.dumps(output, ensure_ascii=False) + "\n")
             out_fh.flush()
-            stats["ok"] += 1
         except Exception as e:  # noqa: BLE001
             error_output = {
                 "id": item.get("uuid") or f"sample_{idx}",
@@ -222,14 +206,7 @@ async def worker(
             }
             out_fh.write(json.dumps(error_output, ensure_ascii=False) + "\n")
             out_fh.flush()
-            stats["errors"] += 1
         finally:
-            progress.set_postfix(
-                ok=stats["ok"],
-                errors=stats["errors"],
-                refresh=False,
-            )
-            progress.update(1)
             queue.task_done()
 
 
@@ -251,9 +228,8 @@ async def main():
     dataset_id = dataset_config["id"]
     prompt_field = dataset_config["prompt_field"]
 
-    # Use dataset-specific defaults if not provided
+    # Use dataset-specific default split if not provided
     split = args.split if args.split is not None else dataset_config["default_split"]
-    subset = args.subset if args.subset is not None else dataset_config.get("subset")
 
     # Generate output filename if not specified
     if args.outfile is None:
@@ -269,7 +245,7 @@ async def main():
     print()
 
     seen_ids = load_seen(args.outfile) if args.resume else set()
-    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
+    dataset = load_dataset(dataset_id, split=split, streaming=True)
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -286,28 +262,10 @@ async def main():
     async with aiohttp.ClientSession(
         timeout=timeout, connector=connector, headers=headers
     ) as session:
-        with (
-            open(args.outfile, "a", encoding="utf-8") as output_file,  # noqa: ASYNC230
-            tqdm(
-                total=args.limit,
-                desc="Generating responses",
-                unit="sample",
-                dynamic_ncols=True,
-            ) as progress,
-        ):
-            stats = {"ok": 0, "errors": 0}
+        with open(args.outfile, "a", encoding="utf-8") as output_file:  # noqa: ASYNC230
             workers = [
                 asyncio.create_task(
-                    worker(
-                        semaphore,
-                        session,
-                        queue,
-                        args,
-                        output_file,
-                        endpoint,
-                        progress,
-                        stats,
-                    )
+                    worker(semaphore, session, queue, args, output_file, endpoint)
                 )
                 for _ in range(args.concurrency)
             ]

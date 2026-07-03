@@ -1,8 +1,10 @@
+# ruff: noqa: ERA001
 import copy
+import warnings
 from typing import ClassVar
 
 import torch
-from torch.nn.attention.flex_attention import create_block_mask, create_mask
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers import AutoConfig, DynamicCache, PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -10,20 +12,151 @@ from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.eagle3 import Eagle3SpeculatorConfig
 from speculators.models.eagle3.attention import (
     create_combined_mask_mod,
-    extend_dense_mask_for_draft_tokens,
     extend_mask_for_draft_tokens,
 )
-from speculators.models.eagle3.metrics import compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
-from speculators.models.metrics import LossConfig, resolve_loss_config
-from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
+from speculators.models.utils import resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.utils.loading import load_model_layers
+
+
+def align_for_step(
+    logits: torch.Tensor,  # shape: [1, total_seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, total_seq_len, draft_vocab_size]
+    loss_mask: torch.Tensor | None,  # shape: [1, total_seq_len]
+    prev_correct: torch.Tensor | None,  # shape: [1, total_seq_len]
+    ttt_step: int,
+):
+    """Align logits, targets, loss_mask, and prev_correct for a given ttt_step.
+
+    There are no target values for the last ttt_step tokens, so we mask them out
+    before computing the loss/accuracy. Likewise, there are no logits for the first
+    ttt_step tokens, so we mask them out.
+    This is equivalent to shifting the target values by ttt_step + 1 to the left
+    which puts them in the correct position for the generated tokens.
+    e.g.
+        indices of targets = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        indices of logits for ttt_step_0 = [1, 2, 3, 4, 5, 6, 7, 8, 9] # no shift
+        indices of logits for ttt_step_1 = [2, 3, 4, 5, 6, 7, 8, 9, 10] # shift by 1
+        indices of logits for ttt_step_2 = [3, 4, 5, 6, 7, 8, 9, 10, 11] # shift by 2
+    The indices for the loss_mask need to be kept in line with the targets indices
+    """
+    logits = logits[:, :-ttt_step] if ttt_step > 0 else logits
+    # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    targets = targets[:, ttt_step:]
+    # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    if loss_mask is not None:
+        loss_mask = loss_mask[:, ttt_step:]
+        # shape: [1, total_seq_len - ttt_step]
+    if prev_correct is not None:
+        # Align with draft starts
+        prev_correct = prev_correct[:, :-ttt_step] if ttt_step > 0 else prev_correct
+        # shape: [1, total_seq_len - ttt_step]
+    return logits, targets, loss_mask, prev_correct
+
+
+@torch.no_grad()
+def compute_accuracy(
+    logits: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    loss_mask: torch.Tensor | None,  # shape: [1, total_seq_len - ttt_step]
+    prev_correct: torch.Tensor | None,  # shape: [1, total_seq_len - ttt_step]
+):
+    # Note: logits, targets, and loss_mask are already aligned for the current ttt_step
+    target_tokens = torch.argmax(targets, dim=-1)
+    predicted_tokens = torch.argmax(logits, dim=-1)
+    # shape: [1, total_seq_len - ttt_step]
+
+    correct = predicted_tokens == target_tokens
+    cond_denom: torch.Tensor | int = correct.numel()
+    if prev_correct is not None:
+        cond_denom = prev_correct.sum()
+        # Update prev_correct in place
+        correct = torch.logical_and(prev_correct, correct, out=prev_correct)
+    if loss_mask is not None:
+        correct = torch.masked_select(correct, loss_mask.to(torch.bool))
+
+    correct_sum = correct.float().sum()
+    full_denom = correct.numel()
+
+    return correct_sum / (full_denom + 1e-5), correct_sum / (cond_denom + 1e-5)
+
+
+def loss_function(
+    logits: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
+    loss_mask: torch.Tensor | None,  # shape: [1, total_seq_len - ttt_step]
+):
+    # Note: logits, targets, and loss_mask are already aligned for the current ttt_step
+    logits = torch.nn.functional.log_softmax(logits, dim=-1)
+    target_p = torch.nn.functional.softmax(targets, dim=-1)
+    elementwise_loss = torch.nn.functional.kl_div(
+        logits, target_p, reduction="none", log_target=False
+    )
+
+    if loss_mask is not None:
+        elementwise_loss = elementwise_loss * loss_mask.unsqueeze(-1)
+        denominator: torch.Tensor | int = loss_mask.sum(dim=1) + 1e-5
+    else:
+        denominator = logits.shape[1]  # total_seq_len - ttt_step
+    batch_loss = torch.sum(elementwise_loss, dim=(1, 2)) / denominator
+    # shape: [1]
+    return batch_loss.mean()
+
+
+def compute_metrics(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    prev_correct: torch.Tensor | None,
+    ttt_step: int,
+    ttt_step_loss_decay: float,
+) -> tuple[torch.Tensor, dict]:
+    """Compute metrics for a given ttt_step.
+
+    Args:
+        logits: The logits for the current ttt_step.
+        targets: The targets for the current ttt_step.
+        loss_mask: The loss mask for the current ttt_step.
+        prev_correct: The previous correct predictions for the current ttt_step.
+        ttt_step: The current ttt_step.
+        ttt_step_loss_decay: The loss decay for the current ttt_step.
+
+    Effects:
+        Modifies prev_correct in place.
+
+    Returns:
+        Loss value and metrics dictionary.
+    """
+
+    s_metrics = {}
+    s_logits, s_targets, s_loss_mask, s_prev_correct = align_for_step(
+        logits, targets, loss_mask, prev_correct, ttt_step
+    )
+    loss_weight = ttt_step_loss_decay**ttt_step
+    s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask)
+
+    s_full_acc, s_cond_acc = compute_accuracy(
+        s_logits, s_targets, s_loss_mask, s_prev_correct
+    )
+    s_metrics[f"loss_{ttt_step}"] = s_loss.detach().clone()
+    s_metrics[f"full_acc_{ttt_step}"] = s_full_acc
+    s_metrics[f"cond_acc_{ttt_step}"] = s_cond_acc
+
+    return s_loss, s_metrics
+
+
+def conditional_torch_compile(func):
+    if torch.cuda.is_available() and hasattr(torch, "compile"):
+        return torch.compile(func)
+    else:
+        return func
 
 
 @SpeculatorModel.register("eagle3")
 class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[Eagle3SpeculatorConfig]] = Eagle3SpeculatorConfig  # type: ignore[misc]
-    _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
+    _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
         "embed_tokens.weight",
         "verifier_norm.weight",
         "verifier_lm_head.weight",
@@ -41,16 +174,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
     def __init__(self, config: Eagle3SpeculatorConfig):
         # Forcibly override config settings
-        if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
-            config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
-                "simple_flex_attention"
-            )
-        self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
-        self._create_mask_fn = (
-            create_block_mask
-            if self._attn_impl == "simple_flex_attention"
-            else create_mask
-        )
+        impl = "simple_flex_attention"
+        config.transformer_layer_config._attn_implementation = impl  # noqa: SLF001
         super().__init__(config=config)
         self._init_vocab(config)
 
@@ -93,6 +218,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         self.verifier_norm = norm_class(self.hidden_size, eps=tl_config.rms_norm_eps)
         self.verifier_norm.weight.requires_grad = False
 
+        # Normalize draft path input (gpt-oss only)
         if config.norm_before_fc:
             self.input_norm = self._model_definitions.norm_class(
                 3 * self.hidden_size,
@@ -103,25 +229,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
         self.post_init()
 
-    @property
-    def target_layer_ids(self) -> list[int]:
-        """Target layer IDs for auxiliary hidden states."""
-        return self.config.eagle_aux_hidden_state_layer_ids
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        verifier_path = model.config.speculators_config.verifier.name_or_path
-        if verifier_path is not None:
-            model.config.eagle_aux_hidden_state_layer_ids = resolve_target_layer_ids(
-                model.config.eagle_aux_hidden_state_layer_ids, verifier_path
-            )
-        return model
-
-    def load_verifier_weights(self):
+    def load_verifier_weights(self):  # noqa: C901
         super().load_verifier_weights()
-
-        self.embed_tokens.weight.requires_grad_(self.config.embed_requires_grad)
 
         verifier_config = self.config.speculators_config.verifier
         verifier_model_config = AutoConfig.from_pretrained(verifier_config.name_or_path)  # type: ignore[arg-type]
@@ -136,12 +245,29 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 f" match draft hidden size {self.hidden_size}."
             )
 
+        # Load verifier norm weights
+        verifier_weights = load_model_layers(
+            ["model.norm.weight"],
+            verifier_config.name_or_path,  # type: ignore[arg-type]
+        )
+
+        if "model.norm.weight" not in verifier_weights:
+            warnings.warn(
+                f"Could not find final norm weights in {verifier_config.name_or_path}. "
+                "Using default initialization (weight=1.0).",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            verifier_norm_sd = {"weight": verifier_weights["model.norm.weight"]}
+            self.verifier_norm.load_state_dict(verifier_norm_sd)
+
     @conditional_torch_compile
     def forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,  # shape: [1, total_seq_len, 3 * hidden_size]
         input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        lengths: torch.Tensor | None = None,  # shape: [batch_size]
         loss_mask: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         verifier_last_hidden_states: torch.Tensor
@@ -149,12 +275,13 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         use_off_policy_tokens: bool = False,
-        loss_config: LossConfig | None = None,
         **kwargs,
     ):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
 
+        if lengths is None:
+            lengths = torch.tensor([total_seq_len], dtype=torch.long, device=device)
         if position_ids is None:
             position_ids = 1 + torch.arange(
                 total_seq_len, dtype=torch.long, device=device
@@ -163,11 +290,9 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
         past_key_values = DynamicCache(config=self.config.transformer_layer_config)
 
-        combined_mask_mod = create_combined_mask_mod(
-            document_ids.squeeze(0).to(device), total_seq_len
-        )
+        combined_mask_mod = create_combined_mask_mod(lengths.to(device), total_seq_len)
         # Note: Attention mask is stored as a BlockMask object
-        attention_mask = self._create_mask_fn(
+        attention_mask = create_block_mask(
             combined_mask_mod,
             B=None,
             H=None,
@@ -231,11 +356,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     **kwargs,
                 )
 
-            if self.config.norm_output:
-                hidden_states = self.norm(hidden_states)
-                logits = self.lm_head(hidden_states)
-            else:
-                logits = self.lm_head(self.norm(hidden_states))
+            logits = self.lm_head(self.norm(hidden_states))
             # shape: [1, total_seq_len, draft_vocab_size]
 
             if return_loss:
@@ -246,7 +367,6 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
-                    loss_config=loss_config,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
@@ -275,19 +395,12 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 )
                 # shape: [1, total_seq_len]
 
-            if self._attn_impl == "simple_flex_attention":
-                attention_mask = extend_mask_for_draft_tokens(attention_mask)
-            else:
-                attention_mask = extend_dense_mask_for_draft_tokens(
-                    attention_mask,  # type: ignore[arg-type]
-                    total_seq_len,
-                )
+            attention_mask = extend_mask_for_draft_tokens(attention_mask)
             position_ids = position_ids + 1
             # shape: [1, total_seq_len]
 
         if return_loss:
-            metrics["loss_sum"] = loss.detach().clone()
-            metrics["loss_total"] = torch.tensor(1.0, device=device)
+            metrics["loss"] = loss.detach().clone()
             return draft_tokens, loss, metrics
         else:
             return draft_tokens
@@ -315,13 +428,9 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         Returns:
             Initialized Eagle3DraftModel
         """
-        # Resolve target layer IDs if not provided
         target_layer_ids = resolve_target_layer_ids(
-            kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
-        )
-
-        verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
-            "draft_attn_impl", "simple_flex_attention"
+            kwargs.get("target_layer_ids"),
+            kwargs["verifier_name_or_path"],
         )
 
         config = Eagle3SpeculatorConfig(
@@ -329,7 +438,6 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             draft_vocab_size=kwargs["draft_vocab_size"],
             norm_before_residual=kwargs["norm_before_residual"],
             norm_before_fc=kwargs.get("norm_before_fc", False),
-            norm_output=kwargs.get("norm_output", False),
             embed_requires_grad=kwargs.get("embed_requires_grad", False),
             eagle_aux_hidden_state_layer_ids=target_layer_ids,
             speculators_config=SpeculatorsConfig(
@@ -340,8 +448,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     )
                 ],
                 default_proposal_method="greedy",
-                verifier=VerifierConfig.from_pretrained(
-                    kwargs["verifier_name_or_path"]
+                verifier=VerifierConfig.from_config(
+                    verifier_config, name_or_path=kwargs["verifier_name_or_path"]
                 ),
             ),
         )
@@ -360,17 +468,14 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         Returns:
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
-        loss_config = resolve_loss_config(kwargs["loss_fn"])
         train_kwargs = {
             "use_off_policy_tokens": kwargs["use_off_policy_tokens"],
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
-            "loss_config": loss_config,
         }
         val_kwargs = {
             "use_off_policy_tokens": False,
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
-            "loss_config": loss_config,
         }
         return train_kwargs, val_kwargs
