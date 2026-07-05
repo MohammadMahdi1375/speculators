@@ -692,14 +692,16 @@ def load_processor(target_model_path: str, *, trust_remote_code: bool = False):
             target_model_path,
             trust_remote_code=trust_remote_code,
         )
-    except (ValueError, OSError):
-        # Text-only models (e.g. DeepSeek-V4-Flash) have no AutoProcessor class,
-        # only a tokenizer. A tokenizer is a valid ProcessorLike here.
-        from transformers import AutoTokenizer  # noqa: PLC0415
+    except (ValueError, OSError, KeyError):
+        # Text-only models whose model_type isn't registered in this transformers
+        # version (e.g. DeepSeek-V4-Flash) have no AutoProcessor, and AutoTokenizer
+        # still routes through AutoConfig and fails on the unknown model_type.
+        # PreTrainedTokenizerFast loads tokenizer.json directly, bypassing AutoConfig.
+        from transformers import PreTrainedTokenizerFast  # noqa: PLC0415
 
-        processor = AutoTokenizer.from_pretrained(
+        processor = PreTrainedTokenizerFast.from_pretrained(
             target_model_path,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=True,
         )
     _resolve_pad_token(processor)
 
