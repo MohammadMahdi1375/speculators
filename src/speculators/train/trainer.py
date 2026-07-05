@@ -196,6 +196,15 @@ class Trainer:
 
         apply_fully_sharded(self.model)
 
+        # Verifier modules are excluded from FSDP (see apply_fully_sharded),
+        # so move them to the local device explicitly; otherwise the
+        # broadcast_from_rank0 state-dict load sees mixed devices
+        # (sharded params on NPU + verifier params on CPU) -> 'Multiple devices found'.
+        for _mn in ("verifier_norm", "verifier_lm_head"):
+            _m = getattr(self.model, _mn, None)
+            if _m is not None:
+                _m.to(self.local_rank)
+
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
         else:
