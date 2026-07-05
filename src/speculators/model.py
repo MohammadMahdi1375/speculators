@@ -141,18 +141,33 @@ class DraftVocabMixin(nn.Module):
         if verifier_config.name_or_path is None:
             return
 
-        # Determine which weights to load based on model attributes
-        weights_to_load = ["embed_tokens.weight", "lm_head.weight"]
+        # Determine which weights to load based on model attributes.
+        # Also request DeepSeek-V4-style names (embed/head/norm), which some
+        # verifiers use instead of embed_tokens/lm_head/model.norm.
+        weights_to_load = [
+            "embed_tokens.weight",
+            "embed.weight",
+            "lm_head.weight",
+            "head.weight",
+        ]
         if hasattr(self, "verifier_norm"):
-            weights_to_load.append("model.norm.weight")
+            weights_to_load += ["model.norm.weight", "norm.weight"]
 
         verifier_weights = load_model_layers(
             weights_to_load,
             verifier_config.name_or_path,
         )
 
-        embed_tokens_weight = verifier_weights["embed_tokens.weight"]
-        lm_head_weight = verifier_weights.get("lm_head.weight", embed_tokens_weight)
+        embed_tokens_weight = (
+            verifier_weights["embed_tokens.weight"]
+            if "embed_tokens.weight" in verifier_weights
+            else verifier_weights["embed.weight"]
+        )
+        lm_head_weight = (
+            verifier_weights["lm_head.weight"]
+            if "lm_head.weight" in verifier_weights
+            else verifier_weights.get("head.weight", embed_tokens_weight)
+        )
 
         # Load embed_tokens if not already loaded (NaN means uninitialized)
         if self.embed_tokens.weight.isnan().any():
@@ -178,7 +193,12 @@ class DraftVocabMixin(nn.Module):
 
         # Load verifier norm weights if the model has verifier_norm
         if hasattr(self, "verifier_norm"):
-            if "model.norm.weight" not in verifier_weights:
+            norm_key = next(
+                (k for k in ("model.norm.weight", "norm.weight")
+                 if k in verifier_weights),
+                None,
+            )
+            if norm_key is None:
                 warnings.warn(
                     f"Could not find final norm weights in "
                     f"{verifier_config.name_or_path}. "
@@ -187,7 +207,7 @@ class DraftVocabMixin(nn.Module):
                     stacklevel=2,
                 )
             else:
-                verifier_norm_sd = {"weight": verifier_weights["model.norm.weight"]}
+                verifier_norm_sd = {"weight": verifier_weights[norm_key]}
                 self.verifier_norm.load_state_dict(verifier_norm_sd)  # type: ignore[union-attr]
 
         # HF's from_pretrained resets requires_grad=True on all parameters.
