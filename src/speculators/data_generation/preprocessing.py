@@ -758,6 +758,11 @@ def load_and_preprocess_dataset(
     log.subsection("Loading processor")
     processor = load_processor(target_model_path, trust_remote_code=trust_remote_code)
 
+    # DeepSeek-V4-Flash ships no chat template; inject the DeepSeek default so the
+    # gate below and apply_chat_template work (mirrors the dsv4 training pipeline).
+    if getattr(processor, "chat_template", None) is None:
+        processor.chat_template = "{{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜>' }}{% generation %}{{ message['content'] }}{{ eos_token }}{% endgeneration %}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% endif %}"
+
     if not hasattr(processor, "apply_chat_template") or processor.chat_template is None:
         raise ValueError(
             f"Processor for {target_model_path} does not support chat templates. "
