@@ -107,7 +107,9 @@ def setup_dataloader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        # prefetch_factor / persistent_workers are only valid with worker
+        # processes; co-located (--in-process-target) forces num_workers=0.
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         pin_memory=True,
         collate_fn=create_collate_fn(
             args.total_seq_len,
@@ -116,7 +118,7 @@ def setup_dataloader(
             dtype=dataset.hidden_states_dtype,
             preprocess=preprocess,
         ),
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
     )
 
 

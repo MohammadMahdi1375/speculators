@@ -212,7 +212,6 @@ run_train() {
         --max-anchors "$MAX_ANCHORS" \
         --num-layers "$NUM_LAYERS" \
         --target-layer-ids $TARGET_LAYER_IDS \
-        --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
         --draft-arch qwen3 \
         --draft-hidden-act silu \
         --mask-token-id 1 \
@@ -228,7 +227,6 @@ run_train() {
         --no-resume-from-checkpoint \
         --seed "$SEED"
 }
-# --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
 # --no-resume-from-checkpoint
 if [ "$LOG_FILTER" = "1" ]; then
     # Preserve torchrun exit status while filtering high-volume known-noise lines.
