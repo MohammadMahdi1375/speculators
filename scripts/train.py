@@ -139,7 +139,7 @@ def create_transformer_layer_config(  # noqa: C901
             f"Draft architecture '{draft_arch}' is not yet supported in vLLM. "
             "The trained model may not be usable for inference in vLLM. "
             "Consider using 'llama' or 'qwen3' for full vLLM compatibility.",
-            stacklevel=2,
+           stacklevel=2,
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
@@ -299,7 +299,7 @@ def _load_mappings(d2t_path, t2d_path, expected_draft_vocab_size: int | None):
 
 
 def parse_vocab_mappings(args: argparse.Namespace):
-    if args.d2t_path or args.t2d_path:
+   if args.d2t_path or args.t2d_path:
         if not (args.d2t_path and args.t2d_path):
             raise ValueError(
                 "Both t2d and d2t must be provided together, or both must be omitted. "
@@ -484,6 +484,100 @@ def main(args: argparse.Namespace):  # noqa: C901
         )
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
+    # @Moh_7596 in-process co-located target (external_launcher)
+    engine = None
+    if args.in_process_target:
+        import os as _os
+        import vllm.distributed.parallel_state as _ps
+        def _node_count_moh(_pg=None):
+            _ws = int(_os.environ.get('WORLD_SIZE', '1'))
+            _lws = int(_os.environ.get('LOCAL_WORLD_SIZE', str(_ws)))
+            return max(1, _ws // max(1, _lws))
+        _ps._node_count = _node_count_moh
+        import vllm.distributed.device_communicators.shm_broadcast as _shm
+        def _in_same_node_moh(_pg, source_rank=0):
+            import torch.distributed as _d
+            _lws = int(_os.environ.get('LOCAL_WORLD_SIZE', '0')) or _d.get_world_size()
+            _n = _d.get_world_size(group=_pg)
+            _wnode = _d.get_global_rank(_pg, source_rank) // _lws
+            return [(_d.get_global_rank(_pg, _r) // _lws) == _wnode for _r in range(_n)]
+        _ps.in_the_same_node_as = _in_same_node_moh
+        _shm.in_the_same_node_as = _in_same_node_moh
+        from vllm import LLM
+        from transformers import AutoConfig as _AutoConfig
+        # _DSV4_CFG_SHIM: transformers lacks deepseek_v4; fall back to raw config.json
+        try:
+            _vcfg = _AutoConfig.from_pretrained(args.verifier_name_or_path)
+        except Exception:
+            import json as _json, os as _os
+            class _CfgShim(dict):
+                def __getattr__(self, _k):
+                    try:
+                        return self[_k]
+                    except KeyError:
+                        raise AttributeError(_k)
+                def to_dict(self):
+                    return dict(self)
+            with open(_os.path.join(args.verifier_name_or_path, 'config.json')) as _cf:
+                _vcfg = _CfgShim(_json.load(_cf))
+        _vcfg = getattr(_vcfg, 'text_config', _vcfg)
+        _n = _vcfg.num_hidden_layers
+        _tlids = [i for i in (list(args.target_layer_ids) if args.target_layer_ids else [2, _n // 2, _n - 3]) if 0 <= i < _n]  # Moh_7596 drop OOR aux ids
+        _tlids = sorted(set(_tlids)); args.target_layer_ids = list(_tlids); print("[DFLASH] num_hidden_layers", _n, "aux_layer_ids", _tlids, "draft_fc_in", len(_tlids), flush=True)
+        _spec = {'method': 'extract_hidden_states', 'num_speculative_tokens': 1, 'draft_model_config': {'hf_config': {'eagle_aux_hidden_state_layer_ids': _tlids}}}
+        _kv = {'kv_connector': 'ExampleHiddenStatesConnector', 'kv_role': 'kv_producer', 'kv_buffer_size': 128 * 1024 * 1024, 'kv_connector_extra_config': {'shared_storage_path': args.shared_storage_path}}
+        import vllm.v1.core.single_type_kv_cache_manager as _stm; import vllm_ascend.patch.platform.patch_kv_cache_interface as _pkc; [_stm.spec_manager_map.setdefault(_A.__mro__[1], _stm.spec_manager_map[_A]) for _A in (_pkc.AscendMLAAttentionSpec, _pkc.AscendSlidingWindowMLASpec) if _A in _stm.spec_manager_map]  # Moh_7596 stock-spec-register
+        # DeepSeek-V4 DSA/QLI is block-oriented. Do not use max_model_len=seq+1
+        # directly, because 2049 is not block-aligned. Also restrict the
+        # in-process target to one long prefill request per scheduler step to
+        # avoid QuantLightningIndexer AICore failures on 2 x 2048-token prefills.
+        dsa_block_size = 128
+        target_max_model_len = (
+            ((args.total_seq_len + 1 + dsa_block_size - 1) // dsa_block_size)
+            * dsa_block_size
+        )
+        if rank == 0:
+            print(
+                f"[DFLASH] vLLM target max_model_len={target_max_model_len} "
+                f"for total_seq_len={args.total_seq_len}, block_size={dsa_block_size}",
+                flush=True,
+            )
+
+        # DeepSeek-V4 / Ascend-safe target-engine settings for DFlash.
+        # Need +1 because vLLM generate() validates prompt_len + max_tokens.
+        # Need 128 alignment and single-sequence scheduling to avoid DSA/QLI crashes.
+        dsa_block_size = 128
+        target_max_model_len = (
+            ((args.total_seq_len + 1 + dsa_block_size - 1) // dsa_block_size)
+            * dsa_block_size
+        )
+        if rank == 0:
+            print(
+                f"[DFLASH] vLLM target max_model_len={target_max_model_len} "
+                f"for total_seq_len={args.total_seq_len}, block_size={dsa_block_size}",
+                flush=True,
+            )
+
+        engine = LLM(
+            model=args.verifier_name_or_path,
+            tensor_parallel_size=args.target_tp_size,
+            enable_expert_parallel=args.enable_expert_parallel,
+            distributed_executor_backend="external_launcher",
+            enforce_eager=True,
+            trust_remote_code=getattr(args, "trust_remote_code", True),
+            seed=args.seed,
+            speculative_config=_spec,
+            kv_transfer_config=_kv,
+            enable_chunked_prefill=False,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=target_max_model_len,
+            block_size=dsa_block_size,
+            max_num_seqs=1,
+            max_num_batched_tokens=target_max_model_len,
+            enable_prefix_caching=False,
+        )
+        args.num_workers = 0
+
     if args.speculator_type == "mtp":
         if args.draft_attn_impl != "simple_flex_attention":
             raise ValueError(
@@ -594,6 +688,8 @@ def main(args: argparse.Namespace):  # noqa: C901
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            engine=engine,
+            seed=args.seed,
         )
         val_dataset = ArrowDataset(
             datapath=args.data_path,
@@ -607,6 +703,8 @@ def main(args: argparse.Namespace):  # noqa: C901
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            engine=engine,
+            seed=args.seed,
         )
 
     train_loader = setup_dataloader(
@@ -753,6 +851,12 @@ def validate_draft_init_args(
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
+    # --- co-located (in-process) target engine ---
+    parser.add_argument("--in-process-target", action="store_true")
+    parser.add_argument("--target-tp-size", type=int, default=1)
+    parser.add_argument("--shared-storage-path", type=str, default="/dev/shm/hidden_states")
+    parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -1002,7 +1106,7 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use off-policy tokens during training (required for regenerated data)",
-    )
+   )
     # Model hyperparameters
     parser.add_argument(
         "--norm-before-residual",

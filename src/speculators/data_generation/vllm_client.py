@@ -247,3 +247,29 @@ def generate_hidden_states(
         )
 
     return extract_output(res, token_ids)
+
+
+def generate_hidden_states_inprocess(engine, client_item, *, seed: int = 42):
+    """Co-located target: generate hidden states from an in-process vLLM engine.
+
+    Mirrors ``generate_hidden_states`` but talks to a local ``LLM`` engine
+    instead of an HTTP endpoint. Returns the hidden-states file path emitted by
+    the target's KV connector (``kv_transfer_params['hidden_states_path']``).
+    """
+    from vllm import SamplingParams  # local import: avoid vllm at module load
+
+    token_ids = client_item["input_ids"]
+    messages = client_item.get("messages")
+    sp = SamplingParams(max_tokens=1, temperature=0.0, seed=seed)
+    if messages is None:
+        outputs = engine.generate({"prompt_token_ids": token_ids}, sp)
+    else:
+        outputs = engine.chat(messages, sp, add_generation_prompt=False)
+    out = outputs[0]
+    ptids = list(out.prompt_token_ids) if getattr(out, "prompt_token_ids", None) is not None else None
+    if ptids is not None and ptids != token_ids:
+        raise InvalidResponseError(f"Prompt token IDs mismatch: expected {token_ids}, got {ptids}")
+    kv = getattr(out, "kv_transfer_params", None)
+    if not kv or "hidden_states_path" not in kv:
+        raise InvalidResponseError("RequestOutput missing kv_transfer_params/hidden_states_path")
+    return kv["hidden_states_path"]

@@ -22,6 +22,7 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
     ClientItem,
     generate_hidden_states,
+    generate_hidden_states_inprocess,
     wait_for_lock,
 )
 from speculators.train.noise_transforms import TransformTensors
@@ -209,7 +210,7 @@ class BaseDataset(Dataset):
         # }
 
         # Apply transform
-        if self.transform:
+       if self.transform:
             data = self.transform(data)
 
         return data
@@ -241,6 +242,8 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        engine: object | None = None,
+        seed: int = 42,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -274,6 +277,8 @@ class ArrowDataset(BaseDataset):
         self.on_missing = on_missing
         self.on_generate = on_generate
         self.client: openai.OpenAI | None = None
+        self.engine = engine
+        self.seed = seed
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
@@ -307,20 +312,27 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
-        if not self.client:
+        if self.engine is None and not self.client:
             self._setup_client()
 
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
 
         try:
-            hs_filepath = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
+            if self.engine is not None:
+                hs_filepath = generate_hidden_states_inprocess(
+                    self.engine,
+                    {"input_ids": dataset_item["input_ids"].tolist()},
+                    seed=self.seed,
+                )
+            else:
+                hs_filepath = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
 
             loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
             if loaded_hs is None:
