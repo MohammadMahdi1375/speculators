@@ -224,7 +224,7 @@ run_train() {
         --on-missing generate \
         --on-generate delete \
         --log-freq 10 \
-        --save-steps 1000 \
+        --checkpoint-freq 1.0 \
         --no-resume-from-checkpoint \
         --seed "$SEED"
 }
