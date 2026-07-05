@@ -203,7 +203,10 @@ class Trainer:
         for _mn in ("verifier_norm", "verifier_lm_head"):
             _m = getattr(self.model, _mn, None)
             if _m is not None:
-                _m.to(self.local_rank)
+                # Match FSDP's MixedPrecisionPolicy(param_dtype=bfloat16); these
+                # modules bypass FSDP so they need the cast applied explicitly,
+                # otherwise verifier_lm_head (Half) mismatches bf16 activations.
+                _m.to(device=self.local_rank, dtype=torch.bfloat16)
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
