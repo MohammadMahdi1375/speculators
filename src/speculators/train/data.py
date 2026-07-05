@@ -184,7 +184,7 @@ class BaseDataset(Dataset):
         #  "input_ids": [seq_len],
         #  "verifier_last_hidden_states": [seq_len, hidden_size],
         #  "loss_mask": [seq_len],
-        # }
+       # }
 
         # Convert hidden states to the correct dtype
         data = {
@@ -210,7 +210,7 @@ class BaseDataset(Dataset):
         # }
 
         # Apply transform
-       if self.transform:
+        if self.transform:
             data = self.transform(data)
 
         return data

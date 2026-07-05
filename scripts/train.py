@@ -29,7 +29,7 @@ from speculators.models.utils import (
 )
 from speculators.train.data import (
     ArrowDataset,
-    BaseDataset,
+   BaseDataset,
     SampleFileDataset,
     create_collate_fn,
     split_files,
@@ -139,7 +139,7 @@ def create_transformer_layer_config(  # noqa: C901
             f"Draft architecture '{draft_arch}' is not yet supported in vLLM. "
             "The trained model may not be usable for inference in vLLM. "
             "Consider using 'llama' or 'qwen3' for full vLLM compatibility.",
-           stacklevel=2,
+            stacklevel=2,
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
@@ -299,7 +299,7 @@ def _load_mappings(d2t_path, t2d_path, expected_draft_vocab_size: int | None):
 
 
 def parse_vocab_mappings(args: argparse.Namespace):
-   if args.d2t_path or args.t2d_path:
+    if args.d2t_path or args.t2d_path:
         if not (args.d2t_path and args.t2d_path):
             raise ValueError(
                 "Both t2d and d2t must be provided together, or both must be omitted. "
@@ -740,7 +740,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         local_rank=local_rank,
         rank=rank,
         train_call_kwargs=train_call_kwargs,
-        val_call_kwargs=val_call_kwargs,
+       val_call_kwargs=val_call_kwargs,
         optimizer=args.optimizer,
         weight_decay=args.weight_decay,
         muon_lr=args.muon_lr,
@@ -1106,7 +1106,7 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use off-policy tokens during training (required for regenerated data)",
-   )
+    )
     # Model hyperparameters
     parser.add_argument(
         "--norm-before-residual",
