@@ -67,6 +67,6 @@ def select_anchors(
         perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
         anchors[:k] = torch.gather(valid_indices, 0, perm[:k])
         anchor_valid[:k] = True
-    ###############3
+    ###############
     return anchors, anchor_valid
     # shape: [num_anchors], [num_anchors]

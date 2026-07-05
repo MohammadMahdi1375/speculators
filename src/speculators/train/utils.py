@@ -159,6 +159,17 @@ def apply_fully_sharded(model: torch.nn.Module):
     for layer in model.layers:  # type: ignore[union-attr]
         fully_shard(layer, mp_policy=mp_policy)
 
-    fully_shard(model)
+    # Do NOT shard frozen verifier modules (verifier_norm / verifier_lm_head).
+    # They are used only under torch.no_grad() in _backbone_forward, so FSDP would
+    # all-gather them but never reduce-scatter a grad, desyncing the collective
+    # sequence across ranks and deadlocking (fftsplus/AllReduce timeout).
+    # Ignoring them keeps them replicated and out of FSDP's collective bookkeeping.
+    _ignored = [
+        m for name, m in [
+            ("verifier_norm", getattr(model, "verifier_norm", None)),
+            ("verifier_lm_head", getattr(model, "verifier_lm_head", None)),
+        ] if m is not None
+    ]
+    fully_shard(model, ignored_params={p for m in _ignored for p in m.parameters()})
 
     return model
