@@ -577,6 +577,7 @@ def main(args: argparse.Namespace):  # noqa: C901
             max_num_seqs=1,
             max_num_batched_tokens=target_max_model_len,
             enable_prefix_caching=False,
+            additional_config={"multistream_dsv4_dsa_overlap": False},
         )
         args.num_workers = 0
 
