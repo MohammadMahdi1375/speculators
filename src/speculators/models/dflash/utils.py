@@ -55,12 +55,18 @@ def select_anchors(
     k = min(num_anchors, valid_indices.numel())
 
     # Constrain value of k for torch dynamo
-    torch._check(k <= valid_indices.numel())  # noqa: SLF001
-    torch._check(k >= 0)  # noqa: SLF001
+    ##### @Moh_7596
+    # torch._check(k <= valid_indices.numel())  # noqa: SLF001
+    # torch._check(k >= 0)  # noqa: SLF001
 
-    perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
-    anchors[:k] = torch.gather(valid_indices, 0, perm[:k])
-    anchor_valid[:k] = True
-
+    # perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
+    # anchors[:k] = torch.gather(valid_indices, 0, perm[:k])
+    # anchor_valid[:k] = True
+    if k > 0:
+        torch._check(k <= valid_indices.numel())
+        perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
+        anchors[:k] = torch.gather(valid_indices, 0, perm[:k])
+        anchor_valid[:k] = True
+    ###############3
     return anchors, anchor_valid
     # shape: [num_anchors], [num_anchors]
