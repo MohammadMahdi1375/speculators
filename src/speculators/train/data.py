@@ -391,6 +391,10 @@ class ArrowDataset(BaseDataset):
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
+            if getattr(self, "raise_on_generate_error", False):
+                raise RuntimeError(
+                    f"Failed to load/cache hidden states for sample {index}: {e}"
+                ) from e
             warnings.warn(
                 f"Failed to load/cache hidden states for sample {index}: {e}",
                 stacklevel=1,

@@ -584,6 +584,32 @@ def main(args: argparse.Namespace):  # noqa: C901
                 flush=True,
             )
 
+        _env_target_max_model_len = _os.environ.get("DFLASH_TARGET_MAX_MODEL_LEN")
+        if _env_target_max_model_len:
+            try:
+                _requested_target_max_model_len = int(_env_target_max_model_len)
+            except ValueError as _exc:
+                raise ValueError(
+                    "DFLASH_TARGET_MAX_MODEL_LEN must be an integer, got "
+                    f"{_env_target_max_model_len!r}"
+                ) from _exc
+            if _requested_target_max_model_len < target_max_model_len:
+                raise ValueError(
+                    "DFLASH_TARGET_MAX_MODEL_LEN is too small: "
+                    f"requested={_requested_target_max_model_len}, "
+                    f"required_at_least={target_max_model_len}"
+                )
+            target_max_model_len = (
+                ((_requested_target_max_model_len + dsa_block_size - 1) // dsa_block_size)
+                * dsa_block_size
+            )
+            if rank == 0:
+                print(
+                    f"[DFLASH] env override vLLM target max_model_len={target_max_model_len} "
+                    f"from DFLASH_TARGET_MAX_MODEL_LEN={_env_target_max_model_len}",
+                    flush=True,
+                )
+
         engine = LLM(
             model=args.verifier_name_or_path,
             tensor_parallel_size=args.target_tp_size,
@@ -764,6 +790,8 @@ def main(args: argparse.Namespace):  # noqa: C901
             # sample. Do not use the distributed/multipack sampler here; TP=16
             # vLLM collectives require every rank to enter the same sequence of
             # engine.generate() calls.
+            setattr(ds, "raise_on_generate_error", True)
+
             for i in range(len(ds)):
                 loaded_hs = ds._maybe_generate_hs(i)  # noqa: SLF001
                 if loaded_hs is None:
