@@ -560,6 +560,30 @@ def main(args: argparse.Namespace):  # noqa: C901
                 flush=True,
             )
 
+        # Hidden-state extraction renders the base sequence plus DFlash anchor
+        # tokens, and vLLM generate(max_tokens=1) validates
+        # prompt_len + 1 <= max_model_len. With seq_len=1024 and
+        # max_anchors=128, rendered prompts can reach 1152 tokens, so
+        # seq_len + 1 rounded to 1152 is still too small.
+        required_target_context_len = (
+            args.total_seq_len + getattr(args, "max_anchors", 0) + 1
+        )
+        corrected_target_max_model_len = (
+            ((required_target_context_len + dsa_block_size - 1) // dsa_block_size)
+            * dsa_block_size
+        )
+        if corrected_target_max_model_len > target_max_model_len:
+            target_max_model_len = corrected_target_max_model_len
+        if rank == 0:
+            print(
+                f"[DFLASH] corrected vLLM target max_model_len={target_max_model_len} "
+                f"for total_seq_len={args.total_seq_len}, "
+                f"max_anchors={getattr(args, 'max_anchors', 0)}, "
+                f"required_context_len={required_target_context_len}, "
+                f"block_size={dsa_block_size}",
+                flush=True,
+            )
+
         engine = LLM(
             model=args.verifier_name_or_path,
             tensor_parallel_size=args.target_tp_size,
