@@ -227,6 +227,44 @@ def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
     return None
 
 
+
+
+def _safe_cache_generated_hs(source_path: Path, target_path: Path) -> None:
+    """Atomically cache a generated hidden-state file across local ranks.
+
+    In co-located external-launcher runs, all TP ranks may generate the same
+    sample in lockstep. They can therefore race on both the temporary vLLM
+    connector file and the final hs_<idx>.safetensors cache file. Use a file
+    lock plus atomic replace so only one rank publishes the cache entry while
+    the others safely observe it.
+    """
+    import fcntl
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(str(target_path) + ".lock")
+    rank = os.environ.get("RANK", "0")
+    pid = os.getpid()
+    tmp_path = target_path.with_name(
+        f".{target_path.name}.rank{rank}.pid{pid}.tmp"
+    )
+
+    with lock_path.open("w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if not target_path.exists():
+                shutil.copy2(source_path, tmp_path)
+                os.replace(tmp_path, target_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    # The vLLM connector file is scratch. It may be shared by several ranks or
+    # already removed by a peer, so deletion must be best-effort.
+    try:
+        source_path.unlink()
+    except FileNotFoundError:
+        pass
 class ArrowDataset(BaseDataset):
     def __init__(
         self,
@@ -344,9 +382,12 @@ class ArrowDataset(BaseDataset):
                 case "cache":
                     file_idx = self._map_to_file_idx(index)
                     target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-                    shutil.move(hs_filepath, target_path)
+                    _safe_cache_generated_hs(Path(hs_filepath), target_path)
                 case "delete":
-                    Path(hs_filepath).unlink()
+                    try:
+                        Path(hs_filepath).unlink()
+                    except FileNotFoundError:
+                        pass
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise

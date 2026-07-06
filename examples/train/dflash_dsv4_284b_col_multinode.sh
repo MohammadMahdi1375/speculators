@@ -24,9 +24,15 @@ set -eo pipefail
 
 NODE_RANK="${1:?usage: bash dflash_dsv4_284b_col_multinode.sh <node_rank 0|1>   (0=parent, 1=child)}"
 
+SPEC_MAIN="/home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main"
+CONDA_ENV="/home/n84449292/m84379596/conda/vllm-ascend-0202"
+
+# Force imports to come from this checkout/submodules, not stale site-packages.
+unset PYTHONPATH
 source /home/n84449292/m84379596/CANN/CANN9.0.0/ascend-toolkit/set_env.sh
 source /home/n84449292/m84379596/CANN/CANN9.0.0/nnal/atb/set_env.sh
-export PATH="/home/n84449292/m84379596/conda/vllm-ascend-0202/bin:$PATH"
+export PATH="$CONDA_ENV/bin:$PATH"
+export PYTHONPATH="$SPEC_MAIN/speculators/src:$SPEC_MAIN/vllm:$SPEC_MAIN/vllm-ascend:${PYTHONPATH:-}"
 
 # ===================== Logging controls =====================
 # Default: quiet training logs.
@@ -36,6 +42,8 @@ DEBUG_LOGS="${DEBUG_LOGS:-0}"
 # Default: filter known noisy torchrun lines before they reach console/tee.
 # Set LOG_FILTER=0 to keep raw torchrun output.
 LOG_FILTER="${LOG_FILTER:-1}"
+CACHE_HS_ONLY="${CACHE_HS_ONLY:-0}"
+TRAIN_NUM_WORKERS="${TRAIN_NUM_WORKERS:-0}"
 
 if [ "$DEBUG_LOGS" = "1" ]; then
     export ASCEND_LAUNCH_BLOCKING=1
@@ -97,11 +105,19 @@ DATASET="/home/n84449292/m84379596/Huggingface/datasets/open_perfectblend_full.j
 DATA_OUT="/home/n84449292/m84379596/dflash_dsv4_col_multinode"
 SHARED_STORAGE_PATH="/dev/shm/hidden_states"
 
-MAX_SAMPLES=1000
+MAX_SAMPLES="${MAX_SAMPLES:-32}"
 SEQ_LENGTH=1024
 EPOCHS=1
 LR=6e-4
 SEED=42
+HS_CACHE_PATH="/home/n84449292/m84379596/dflash_dsv4_col_multinode_hidden_states_ms${MAX_SAMPLES}_sl${SEQ_LENGTH}_seed${SEED}"
+
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+if [ -n "${MAX_SAMPLES:-}" ] && (( MAX_SAMPLES % WORLD_SIZE != 0 )); then
+    echo "ERROR: MAX_SAMPLES=$MAX_SAMPLES must be divisible by WORLD_SIZE=$WORLD_SIZE"
+    echo "Use 32, 992, 1008, 1024, etc."
+    exit 1
+fi
 
 SPECULATOR_TYPE="dflash"
 BLOCK_SIZE=10
@@ -119,6 +135,7 @@ export NO_PROXY="$no_proxy"
 
 export DFLASH_TP_GATHER=1
 export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-3600}"
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 
@@ -139,6 +156,29 @@ export TP_SOCKET_IFNAME="$NET_IFACE"
 cd /home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main/speculators
 mkdir -p logs
 
+echo "=== [node $NODE_RANK] repo/import sanity ==="
+echo "[node $NODE_RANK] parent branch: $(git -C "$SPEC_MAIN" branch --show-current) @ $(git -C "$SPEC_MAIN" rev-parse --short HEAD)"
+echo "[node $NODE_RANK] speculators branch: $(git -C "$SPEC_MAIN/speculators" branch --show-current) @ $(git -C "$SPEC_MAIN/speculators" rev-parse --short HEAD)"
+if [ "$(git -C "$SPEC_MAIN/speculators" branch --show-current)" != "spec_dsv4_test" ]; then
+    echo "ERROR: speculators must be on spec_dsv4_test for this test run"
+    exit 1
+fi
+python - <<'PY'
+import sys
+import torch
+import torch_npu
+import vllm
+import vllm_ascend
+import speculators
+print("python:", sys.executable)
+print("torch:", torch.__version__)
+print("torch_npu:", torch_npu.__version__)
+print("vllm:", vllm.__file__)
+print("vllm_ascend:", vllm_ascend.__file__)
+print("speculators:", speculators.__file__)
+print("npu_count:", torch.npu.device_count())
+PY
+
 echo "=== [node $NODE_RANK] cleanup old local processes and hidden-state files ==="
 pkill -9 -f "scripts/train.py" 2>/dev/null || true
 pkill -9 -f "torchrun"        2>/dev/null || true
@@ -154,6 +194,7 @@ sleep 2
 
 # ---- each node tokenizes its OWN local copy ----
 mkdir -p "$DATA_OUT"
+mkdir -p "$HS_CACHE_PATH"
 
 echo "=== [node $NODE_RANK] prepare_data, node-local copy at $DATA_OUT ==="
 PREP_MAX_SAMPLES_ARGS=()
@@ -184,9 +225,42 @@ echo "=================================================================="
 echo "=== [node $NODE_RANK] train: in-process co-located, target TP=$TARGET_TP_SIZE, draft DP=$((NNODES*NPROC_PER_NODE)) ==="
 echo "[node $NODE_RANK] DEBUG_LOGS=$DEBUG_LOGS LOG_FILTER=$LOG_FILTER"
 echo "[node $NODE_RANK] DFLASH_DISABLE_QLI=${DFLASH_DISABLE_QLI-UNSET}"
+echo "[node $NODE_RANK] CACHE_HS_ONLY=$CACHE_HS_ONLY"
+echo "[node $NODE_RANK] HS_CACHE_PATH=$HS_CACHE_PATH"
 echo "[node $NODE_RANK] VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1-UNSET}"
 echo "[node $NODE_RANK] ASCEND_SLOG_PRINT_TO_STDOUT=${ASCEND_SLOG_PRINT_TO_STDOUT-UNSET}"
 echo "[node $NODE_RANK] ASCEND_GLOBAL_LOG_LEVEL=${ASCEND_GLOBAL_LOG_LEVEL-UNSET}"
+
+
+TARGET_ENGINE_ARGS=()
+CACHE_ARGS=()
+
+if [ "$CACHE_HS_ONLY" = "1" ]; then
+    echo "[node $NODE_RANK] CACHE_HS_ONLY=1: generate hidden-state cache only; no training"
+    rm -rf "$HS_CACHE_PATH"
+    mkdir -p "$HS_CACHE_PATH"
+    TARGET_ENGINE_ARGS=(
+        --in-process-target
+        --target-tp-size "$TARGET_TP_SIZE"
+        --enable-expert-parallel
+        --gpu-memory-utilization 0.75
+        --shared-storage-path "$SHARED_STORAGE_PATH"
+    )
+    CACHE_ARGS=(
+        --hidden-states-path "$HS_CACHE_PATH"
+        --on-missing generate
+        --on-generate cache
+        --cache-hidden-states-only
+    )
+else
+    echo "[node $NODE_RANK] training from cached hidden states only; in-process target disabled"
+    TARGET_ENGINE_ARGS=()
+    CACHE_ARGS=(
+        --hidden-states-path "$HS_CACHE_PATH"
+        --on-missing raise
+        --on-generate cache
+    )
+fi
 
 run_train() {
     ASCEND_RT_VISIBLE_DEVICES="$LOCAL_NPUS" torchrun \
@@ -196,11 +270,7 @@ run_train() {
         --master_port "$MASTER_PORT" \
         --nproc_per_node "$NPROC_PER_NODE" \
         scripts/train.py \
-        --in-process-target \
-        --target-tp-size "$TARGET_TP_SIZE" \
-        --enable-expert-parallel \
-        --gpu-memory-utilization 0.75 \
-        --shared-storage-path "$SHARED_STORAGE_PATH" \
+        "${TARGET_ENGINE_ARGS[@]}" \
         --verifier-name-or-path "$MODEL" \
         --data-path "$DATA_OUT" \
         --save-path "$DATA_OUT/checkpoints" \
@@ -214,16 +284,17 @@ run_train() {
         --target-layer-ids $TARGET_LAYER_IDS \
         --draft-arch qwen3 \
         --draft-hidden-act silu \
+        --draft-attn-impl sdpa \
         --mask-token-id 1 \
         --noise-std 0.0 \
         --scheduler-type cosine \
         --logger tensorboard \
         --run-name dflash_colo_2node \
         --log-dir ./logs/colo_2node \
-        --on-missing generate \
-        --on-generate delete \
+        "${CACHE_ARGS[@]}" \
         --log-freq 10 \
         --checkpoint-freq 1.0 \
+        --num-workers "$TRAIN_NUM_WORKERS" \
         --no-resume-from-checkpoint \
         --seed "$SEED"
 }

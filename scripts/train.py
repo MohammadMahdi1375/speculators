@@ -709,6 +709,65 @@ def main(args: argparse.Namespace):  # noqa: C901
             engine=engine,
             seed=args.seed,
         )
+    if args.cache_hidden_states_only:
+        if args.legacy_data:
+            raise ValueError("--cache-hidden-states-only only supports ArrowDataset data")
+        if not args.in_process_target:
+            raise ValueError("--cache-hidden-states-only requires --in-process-target")
+        if engine is None:
+            raise ValueError("--cache-hidden-states-only requires an initialized target engine")
+        if args.on_missing != "generate":
+            raise ValueError("--cache-hidden-states-only requires --on-missing generate")
+        if args.on_generate != "cache":
+            raise ValueError("--cache-hidden-states-only requires --on-generate cache")
+
+        def _cache_dataset(ds: BaseDataset, name: str) -> None:
+            if not hasattr(ds, "_maybe_generate_hs"):
+                raise TypeError(
+                    f"--cache-hidden-states-only expected ArrowDataset for {name}, "
+                    f"got {type(ds).__name__}"
+                )
+
+            if rank == 0:
+                logger.info(
+                    "[cache-hidden-states-only] caching %s dataset: %d samples",
+                    name,
+                    len(ds),
+                )
+
+            # Important: every distributed rank walks the exact same global
+            # sample order and calls the in-process vLLM target engine for every
+            # sample. Do not use the distributed/multipack sampler here; TP=16
+            # vLLM collectives require every rank to enter the same sequence of
+            # engine.generate() calls.
+            for i in range(len(ds)):
+                loaded_hs = ds._maybe_generate_hs(i)  # noqa: SLF001
+                if loaded_hs is None:
+                    raise RuntimeError(
+                        f"[cache-hidden-states-only] failed to generate/cache "
+                        f"hidden states for {name}[{i}]"
+                    )
+
+                if is_distributed:
+                    torch.distributed.barrier()
+
+                if rank == 0 and ((i + 1) % 10 == 0 or (i + 1) == len(ds)):
+                    logger.info(
+                        "[cache-hidden-states-only] %s cached %d/%d",
+                        name,
+                        i + 1,
+                        len(ds),
+                    )
+
+        _cache_dataset(train_dataset, "train")
+        _cache_dataset(val_dataset, "val")
+
+        if rank == 0:
+            logger.info("[cache-hidden-states-only] done; exiting before training")
+
+        maybe_destroy_distributed()
+        return
+
 
     train_loader = setup_dataloader(
         train_dataset,
@@ -955,6 +1014,18 @@ def parse_args():
             "the hidden states in the args.hidden_states_path. This can be used to "
             "enable hybrid online/offline training, with hidden states generated on the"
             "first epoch, and reused on subsequent epochs."
+        ),
+    )
+    parser.add_argument(
+        "--cache-hidden-states-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate/cache hidden states for the Arrow dataset and exit before "
+            "training. This is intended for co-located multi-rank target engines "
+            "where every rank must enter vLLM TP collectives in the same sample "
+            "order. Requires --in-process-target --on-missing generate "
+            "--on-generate cache."
         ),
     )
     parser.add_argument(
