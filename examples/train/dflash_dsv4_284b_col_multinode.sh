@@ -45,6 +45,14 @@ LOG_FILTER="${LOG_FILTER:-1}"
 CACHE_HS_ONLY="${CACHE_HS_ONLY:-0}"
 TRAIN_NUM_WORKERS="${TRAIN_NUM_WORKERS:-0}"
 
+# Cleanup controls:
+#   CLEAN_HS_CACHE=auto  -> clean final hidden-state cache only in CACHE_HS_ONLY=1 mode
+#   CLEAN_HS_CACHE=0     -> keep existing final cache, useful for resuming/debugging
+#   CLEAN_HS_CACHE=1     -> force clean final cache; only allowed in CACHE_HS_ONLY=1 mode
+#   CLEAN_SHARED_STORAGE=1 -> clean /dev/shm hidden-state scratch files
+CLEAN_HS_CACHE="${CLEAN_HS_CACHE:-auto}"
+CLEAN_SHARED_STORAGE="${CLEAN_SHARED_STORAGE:-1}"
+
 if [ "$DEBUG_LOGS" = "1" ]; then
     export ASCEND_LAUNCH_BLOCKING=1
    export ASCEND_SLOG_PRINT_TO_STDOUT=1
@@ -230,6 +238,7 @@ echo "[node $NODE_RANK] DEBUG_LOGS=$DEBUG_LOGS LOG_FILTER=$LOG_FILTER"
 echo "[node $NODE_RANK] DFLASH_DISABLE_QLI=${DFLASH_DISABLE_QLI-UNSET}"
 echo "[node $NODE_RANK] CACHE_HS_ONLY=$CACHE_HS_ONLY"
 echo "[node $NODE_RANK] HS_CACHE_PATH=$HS_CACHE_PATH"
+echo "[node $NODE_RANK] CLEAN_HS_CACHE=$CLEAN_HS_CACHE CLEAN_SHARED_STORAGE=$CLEAN_SHARED_STORAGE"
 echo "[node $NODE_RANK] DFLASH_TARGET_MAX_MODEL_LEN=${DFLASH_TARGET_MAX_MODEL_LEN-UNSET}"
 echo "[node $NODE_RANK] VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1-UNSET}"
 echo "[node $NODE_RANK] ASCEND_SLOG_PRINT_TO_STDOUT=${ASCEND_SLOG_PRINT_TO_STDOUT-UNSET}"
@@ -241,8 +250,19 @@ CACHE_ARGS=()
 
 if [ "$CACHE_HS_ONLY" = "1" ]; then
     echo "[node $NODE_RANK] CACHE_HS_ONLY=1: generate hidden-state cache only; no training"
-    rm -rf "$HS_CACHE_PATH"
+    if [ "$CLEAN_HS_CACHE" = "auto" ] || [ "$CLEAN_HS_CACHE" = "1" ]; then
+        echo "[node $NODE_RANK] cleaning hidden-state cache before cache build: $HS_CACHE_PATH"
+        rm -rf "$HS_CACHE_PATH"
+    else
+        echo "[node $NODE_RANK] keeping existing hidden-state cache: $HS_CACHE_PATH"
+    fi
     mkdir -p "$HS_CACHE_PATH"
+
+    if [ "$CLEAN_SHARED_STORAGE" = "1" ]; then
+        echo "[node $NODE_RANK] cleaning vLLM hidden-state scratch storage: $SHARED_STORAGE_PATH"
+        rm -rf "$SHARED_STORAGE_PATH"
+        mkdir -p "$SHARED_STORAGE_PATH"
+    fi
     TARGET_ENGINE_ARGS=(
         --in-process-target
         --target-tp-size "$TARGET_TP_SIZE"
@@ -258,6 +278,22 @@ if [ "$CACHE_HS_ONLY" = "1" ]; then
     )
 else
     echo "[node $NODE_RANK] training from cached hidden states only; in-process target disabled"
+
+    if [ "$CLEAN_HS_CACHE" = "1" ]; then
+        echo "ERROR: CLEAN_HS_CACHE=1 would delete the cache before training."
+        echo "Use CACHE_HS_ONLY=1 to rebuild cache, then run training without CLEAN_HS_CACHE=1."
+        exit 1
+    fi
+
+    CACHE_COUNT=$(find "$HS_CACHE_PATH" -maxdepth 1 -name 'hs_*.safetensors' 2>/dev/null | wc -l)
+    echo "[node $NODE_RANK] cached hidden-state files found: $CACHE_COUNT in $HS_CACHE_PATH"
+    if [ "$CACHE_COUNT" -eq 0 ]; then
+        echo "ERROR: no hidden-state cache files found for MAX_SAMPLES=$MAX_SAMPLES."
+        echo "Run cache phase first:"
+        echo "  CACHE_HS_ONLY=1 MAX_SAMPLES=$MAX_SAMPLES bash examples/train/dflash_dsv4_284b_col_multinode.sh $NODE_RANK"
+        exit 1
+    fi
+
     TARGET_ENGINE_ARGS=()
     CACHE_ARGS=(
         --hidden-states-path "$HS_CACHE_PATH"
