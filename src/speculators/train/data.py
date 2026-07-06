@@ -504,9 +504,9 @@ class ArrowDataset(BaseDataset):
             loss_mask = loss_mask.to(dtype=torch.bool)
 
         return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+            "hidden_states": loaded_hs["hidden_states"].flatten(
                 1
-            ),  # [seq_len, 3 * hidden_size]
+            ),  # [seq_len, num_target_layers * hidden_size]
             "input_ids": loaded_hs["token_ids"],  # [seq_len]
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
                 :, -1
