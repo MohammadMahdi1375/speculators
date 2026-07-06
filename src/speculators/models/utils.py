@@ -1,4 +1,6 @@
 import warnings
+import json
+from pathlib import Path
 from functools import partial
 
 import torch
@@ -13,8 +15,51 @@ def conditional_torch_compile(func=None, *args, **kwargs):
     return func
 
 
+
+
+# DFLASH_CFG_SHIM: Transformers in this environment may not yet recognize
+# model_type="deepseek_v4".  For training we only need config attributes such
+# as vocab_size, hidden_size, num_attention_heads, num_hidden_layers, etc.;
+# fall back to a lightweight attribute-access wrapper around config.json.
+class _DFlashConfigShim(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def to_dict(self):
+        return dict(self)
+
+
+def _dflash_wrap_config(value):
+    if isinstance(value, dict):
+        return _DFlashConfigShim({k: _dflash_wrap_config(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_dflash_wrap_config(v) for v in value]
+    return value
+
+
+def _dflash_load_raw_config(verifier_name_or_path: str, cause: Exception):
+    config_path = Path(verifier_name_or_path) / "config.json"
+    if not config_path.exists():
+        raise cause
+    warnings.warn(
+        "AutoConfig could not load verifier config; falling back to raw "
+        f"config.json for DSV4 compatibility: {config_path}. Original error: {cause}",
+        stacklevel=2,
+    )
+    return _dflash_wrap_config(json.loads(config_path.read_text()))
+
+
 def get_verifier_config(verifier_name_or_path: str) -> PretrainedConfig:
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    try:
+        verifier_config = AutoConfig.from_pretrained(
+            verifier_name_or_path,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        verifier_config = _dflash_load_raw_config(verifier_name_or_path, exc)
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
     return verifier_config
@@ -78,3 +123,51 @@ def resolve_draft_intermediate_size(verifier_config: PretrainedConfig) -> int:
         stacklevel=3,
     )
     return intermediate_size
+
+
+# DFLASH_CFG_SHIM_V2: Transformers in this env may not recognize
+# model_type="deepseek_v4".  Override get_verifier_config with a fallback that
+# reads local config.json and exposes dict keys as attributes.
+class _DFlashConfigShimV2(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def to_dict(self):
+        return dict(self)
+
+
+def _dflash_wrap_config_v2(value):
+    if isinstance(value, dict):
+        return _DFlashConfigShimV2({k: _dflash_wrap_config_v2(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_dflash_wrap_config_v2(v) for v in value]
+    return value
+
+
+def get_verifier_config(verifier_name_or_path: str):  # type: ignore[override]
+    try:
+        verifier_config = AutoConfig.from_pretrained(
+            verifier_name_or_path,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        import json as _json
+        import warnings as _warnings
+        from pathlib import Path as _Path
+
+        config_path = _Path(verifier_name_or_path) / "config.json"
+        if not config_path.exists():
+            raise
+        _warnings.warn(
+            "AutoConfig could not load verifier config; falling back to raw "
+            f"config.json for DSV4 compatibility: {config_path}. Original error: {exc}",
+            stacklevel=2,
+        )
+        verifier_config = _dflash_wrap_config_v2(_json.loads(config_path.read_text()))
+
+    if hasattr(verifier_config, "text_config"):
+        verifier_config = verifier_config.text_config
+    return verifier_config

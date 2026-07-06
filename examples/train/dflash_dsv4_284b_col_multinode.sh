@@ -288,6 +288,7 @@ run_train() {
         --target-layer-ids $TARGET_LAYER_IDS \
         --draft-arch qwen3 \
         --draft-hidden-act silu \
+        --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
         --draft-attn-impl sdpa \
         --mask-token-id 1 \
         --noise-std 0.0 \

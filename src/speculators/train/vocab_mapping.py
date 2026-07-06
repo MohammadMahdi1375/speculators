@@ -116,3 +116,21 @@ def get_target_vocab_size(target_vocab_size, target_model_path):
         config = config.text_config
 
     return config.vocab_size
+
+
+# DFLASH_VOCAB_CFG_FALLBACK_V2: override after original definition so
+# DeepSeek-V4 raw config fallback is used even when Transformers AutoConfig
+# does not know model_type="deepseek_v4".
+def get_target_vocab_size(target_vocab_size, target_model_path):  # type: ignore[override]
+    has_vocab = target_vocab_size is not None
+    has_model = target_model_path is not None
+    if has_vocab and has_model:
+        raise ValueError("Cannot specify both target-vocab-size and target-model-path")
+    if not has_vocab and not has_model:
+        raise ValueError("Must specify either target-vocab-size or target-model-path")
+    if has_vocab:
+        return target_vocab_size
+    from speculators.models.utils import get_verifier_config as _dflash_get_verifier_config_v2
+
+    config = _dflash_get_verifier_config_v2(target_model_path)
+    return int(config.vocab_size)
