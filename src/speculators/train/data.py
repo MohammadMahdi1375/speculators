@@ -125,6 +125,13 @@ def _has_multimodal_content(messages: list[dict]) -> bool:
     return any(isinstance(m.get("content"), list) for m in messages)
 
 
+def _to_py_list(values: Any) -> list:
+    """Convert tensor/array/list-like values to a plain Python list."""
+    if hasattr(values, "tolist"):
+        return values.tolist()
+    return list(values)
+
+
 def build_client_item(dataset_item: dict) -> ClientItem:
     """Build a request payload for vLLM hidden-state extraction.
 
@@ -147,7 +154,7 @@ def build_client_item(dataset_item: dict) -> ClientItem:
     Text-only EAGLE-3 models (e.g. Llama) use a plain tokenizer, so
     ``messages`` is never created and this guard is a no-op.
     """
-    out_dict: dict = {"input_ids": dataset_item["input_ids"].tolist()}
+    out_dict: dict = {"input_ids": _to_py_list(dataset_item["input_ids"])}
 
     if "messages" in dataset_item and _has_multimodal_content(dataset_item["messages"]):
         out_dict["messages"] = dataset_item["messages"]
@@ -346,21 +353,65 @@ class ArrowDataset(BaseDataset):
         return len(self.data)
 
     def _compute_approx_lengths(self) -> list[int]:
-        """Get lengths of the dataset samples."""
-        return list(self.data.with_format(None)["seq_len"])
+        """Get lengths of the dataset samples, capped at the training max_len."""
+        return [min(int(x), self.max_len) for x in self.data.with_format(None)["seq_len"]]
+
+    def _truncate_dataset_item_for_hs(
+        self, index: int, dataset_item: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return a row whose token/mask length is bounded by self.max_len.
+
+        DFLASH_TRUNCATE_RAW_ARROW_INPUTS_BEFORE_HS_GENERATION
+
+        Some Arrow rows can keep the original untruncated conversation tokens even
+        when training is configured with --total-seq-len/SEQ_LENGTH=1024. Hidden-
+        state extraction must use the same prefix that training will consume;
+        otherwise vLLM may receive prompts such as 6589 tokens and reject them.
+        """
+        input_ids = dataset_item.get("input_ids")
+        if input_ids is None:
+            return dataset_item
+
+        seq_len = len(input_ids)
+        if seq_len <= self.max_len:
+            return dataset_item
+
+        warnings.warn(
+            f"Truncating sample {index} input_ids from {seq_len} to "
+            f"{self.max_len} before hidden-state generation.",
+            stacklevel=1,
+        )
+
+        item = dict(dataset_item)
+        item["input_ids"] = input_ids[: self.max_len]
+        if "loss_mask" in item and item["loss_mask"] is not None:
+            item["loss_mask"] = item["loss_mask"][: self.max_len]
+        if "seq_len" in item:
+            item["seq_len"] = self.max_len
+
+        # For text-only rows, never let vLLM re-tokenize the original long
+        # messages column. Multimodal rows still need messages, but the current
+        # DSV4 text dataset should go through input_ids only.
+        if "messages" in item and not _has_multimodal_content(item["messages"]):
+            item.pop("messages", None)
+
+        return item
+
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if self.engine is None and not self.client:
             self._setup_client()
 
-        dataset_item = self.data[index]
+        raw_dataset_item = self.data[index]
+        dataset_item = self._truncate_dataset_item_for_hs(index, raw_dataset_item)
+        token_ids_for_hs = _to_py_list(dataset_item["input_ids"])
         client_item = build_client_item(dataset_item)
 
         try:
             if self.engine is not None:
                 hs_filepath = generate_hidden_states_inprocess(
                     self.engine,
-                    {"input_ids": dataset_item["input_ids"].tolist()},
+                    {"input_ids": token_ids_for_hs},
                     seed=self.seed,
                 )
             else:
@@ -376,7 +427,7 @@ class ArrowDataset(BaseDataset):
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states from {hs_filepath}")
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            check_hidden_states(loaded_hs, token_ids_for_hs)
 
             match self.on_generate:
                 case "cache":
@@ -433,13 +484,24 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        dataset_item = self._truncate_dataset_item_for_hs(index, self.data[index])
+        expected_token_ids = torch.as_tensor(
+            _to_py_list(dataset_item["input_ids"]),
+            dtype=loaded_hs["token_ids"].dtype,
+        )
+        if not torch.equal(loaded_hs["token_ids"].cpu(), expected_token_ids.cpu()):
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
-                f"match input ids {self.data[index]['input_ids']}",
+                f"match expected/truncated input ids {expected_token_ids}",
                 stacklevel=1,
             )
             return None
+
+        loss_mask = dataset_item["loss_mask"]
+        if not torch.is_tensor(loss_mask):
+            loss_mask = torch.as_tensor(loss_mask, dtype=torch.bool)
+        else:
+            loss_mask = loss_mask.to(dtype=torch.bool)
 
         return {
             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
@@ -449,7 +511,7 @@ class ArrowDataset(BaseDataset):
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
                 :, -1
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": loss_mask,  # [seq_len]
         }
 
 
