@@ -4,10 +4,17 @@
 #
 # RUN ON BOTH NODES:
 #   parent 80.5.5.108:
-#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 0  2>&1 | tee ./logs/train_dsv4_00.log
+#   MAX_SAMPLES=9920 DEBUG_LOGS=0 LOG_FILTER=1 DFLASH_TARGET_MAX_MODEL_LEN=2048 \ 
+#   CACHE_HS_ONLY=1 MAX_SAMPLES="$MAX_SAMPLES" DEBUG_LOGS="$DEBUG_LOGS" LOG_FILTER="$LOG_FILTER" DFLASH_TARGET_MAX_MODEL_LEN="$DFLASH_TARGET_MAX_MODEL_LEN" bash examples/train/dflash_dsv4_284b_col_multinode.sh 0 2>&1 | tee ./logs/train_dsv4_108.log
+
+#   MAX_SAMPLES="$MAX_SAMPLES" DEBUG_LOGS="$DEBUG_LOGS" LOG_FILTER="$LOG_FILTER" DFLASH_TARGET_MAX_MODEL_LEN="$DFLASH_TARGET_MAX_MODEL_LEN" bash examples/train/dflash_dsv4_284b_col_multinode.sh 0 2>&1 | tee ./logs/train_dsv4_108.log
+
 #
 #   child 80.5.5.109:
-#     bash examples/train/dflash_dsv4_284b_col_multinode.sh 1  2>&1 | tee ./logs/train_dsv4_11.log
+#   MAX_SAMPLES=9920 DEBUG_LOGS=0 LOG_FILTER=1 DFLASH_TARGET_MAX_MODEL_LEN=2048 \ 
+#   CACHE_HS_ONLY=1 MAX_SAMPLES="$MAX_SAMPLES" DEBUG_LOGS="$DEBUG_LOGS" LOG_FILTER="$LOG_FILTER" DFLASH_TARGET_MAX_MODEL_LEN="$DFLASH_TARGET_MAX_MODEL_LEN" bash examples/train/dflash_dsv4_284b_col_multinode.sh 1 2>&1 | tee ./logs/train_dsv4_109.log
+
+#   MAX_SAMPLES="$MAX_SAMPLES" DEBUG_LOGS="$DEBUG_LOGS" LOG_FILTER="$LOG_FILTER" DFLASH_TARGET_MAX_MODEL_LEN="$DFLASH_TARGET_MAX_MODEL_LEN" bash examples/train/dflash_dsv4_284b_col_multinode.sh 1 2>&1 | tee ./logs/train_dsv4_109.log
 #
 # QUIET MODE, default:
 #   normal training logs, loss lines, tracebacks, and key errors are kept;
