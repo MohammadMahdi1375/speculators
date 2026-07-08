@@ -207,17 +207,18 @@ class Trainer:
         if not load_checkpoint and native_dspark_large:
             if dist.get_rank() == 0:
                 print(
-                    "[native-dspark] syncing parameters before FSDP; "
-                    "skipping post-FSDP torch.Tensor -> DTensor state copy",
+                    "[native-dspark] skipping rank-0 full_state_dict broadcast "
+                    "and skipping CPU tensor broadcast before FSDP; "
+                    "this avoids torch.Tensor/DTensor and CPU/HCCL backend issues.",
                     flush=True,
                 )
 
-            with torch.no_grad():
-                for param in self.model.parameters():
-                    dist.broadcast(param.data, src=0)
-                for buffer in self.model.buffers():
-                    dist.broadcast(buffer.data, src=0)
-
+            # Do not broadcast CPU tensors here. On Ascend/HCCL the default
+            # process group may not support CPU tensors:
+            #   RuntimeError: No backend type associated with device type cpu
+            #
+            # The native DSpark model is initialized on every rank before FSDP.
+            # FSDP will shard parameters after this barrier.
             dist.barrier()
 
         elif not load_checkpoint and dist.get_rank() == 0:
