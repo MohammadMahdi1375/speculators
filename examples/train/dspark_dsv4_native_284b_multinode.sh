@@ -114,7 +114,7 @@ DATA_OUT="${DATA_OUT:-/home/n84449292/m84379596/dspark_dsv4_native_multinode}"
 HIDDEN_STATES_PATH="$DATA_OUT/hidden_states"
 SHARED_STORAGE_PATH="${SHARED_STORAGE_PATH:-/dev/shm/hidden_states}"
 
-MAX_SAMPLES="${MAX_SAMPLES:-1000}"
+MAX_SAMPLES="${MAX_SAMPLES:-32}"
 SEQ_LENGTH="${SEQ_LENGTH:-1024}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-5}"
@@ -223,6 +223,7 @@ run_cache() {
         --total-seq-len "$SEQ_LENGTH" \
         --speculator-type dflash \
         --block-size "$DSPARK_BLOCK_SIZE" \
+        --draft-vocab-size 129280 \
         --max-anchors "$MAX_ANCHORS" \
         --num-layers 1 \
         --target-layer-ids $TARGET_LAYER_IDS \
@@ -267,6 +268,7 @@ run_train() {
         --total-seq-len "$SEQ_LENGTH" \
         --speculator-type "$SPECULATOR_TYPE" \
         --block-size "$DSPARK_BLOCK_SIZE" \
+        --draft-vocab-size 129280 \
         --max-anchors "$MAX_ANCHORS" \
         --target-layer-ids $TARGET_LAYER_IDS \
         --mask-token-id "$DSPARK_NOISE_TOKEN_ID" \

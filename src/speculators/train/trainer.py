@@ -189,9 +189,38 @@ class Trainer:
             return
 
         # Distributed case
-        # Capture full state dict on rank 0 before FSDP sharding
+        # Capture/synchronize before FSDP sharding.
+        #
+        # Native DeepSeek-V4 DSpark is very large. The old path materialized
+        # a normal torch.Tensor state_dict, then tried to copy it into FSDP
+        # DTensor parameters after sharding. On torch_npu/DTensor this fails:
+        #   "got mixed torch.Tensor and DTensor"
+        #
+        # For this model, synchronize parameters while they are still normal
+        # tensors, then apply FSDP and skip the post-FSDP full_state_dict copy.
+        native_dspark_large = bool(
+            getattr(self.model, "skip_fsdp_rank0_state_broadcast", False)
+        )
+
         full_state_dict = {}
-        if not load_checkpoint and dist.get_rank() == 0:
+
+        if not load_checkpoint and native_dspark_large:
+            if dist.get_rank() == 0:
+                print(
+                    "[native-dspark] syncing parameters before FSDP; "
+                    "skipping post-FSDP torch.Tensor -> DTensor state copy",
+                    flush=True,
+                )
+
+            with torch.no_grad():
+                for param in self.model.parameters():
+                    dist.broadcast(param.data, src=0)
+                for buffer in self.model.buffers():
+                    dist.broadcast(buffer.data, src=0)
+
+            dist.barrier()
+
+        elif not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
         apply_fully_sharded(self.model)
@@ -211,18 +240,23 @@ class Trainer:
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
         else:
-            # Broadcast full state dict from rank 0 to all ranks
-            set_model_state_dict(
-                self.model,
-                full_state_dict,
-                options=StateDictOptions(
-                    full_state_dict=True,
-                    broadcast_from_rank0=True,
-                    strict=False,
-                ),
-            )
-            del full_state_dict
-            dist.barrier()
+            if native_dspark_large:
+                # Already synchronized before FSDP. Do not copy normal tensors
+                # into sharded DTensor parameters.
+                dist.barrier()
+            else:
+                # Broadcast full state dict from rank 0 to all ranks
+                set_model_state_dict(
+                    self.model,
+                    full_state_dict,
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        broadcast_from_rank0=True,
+                        strict=False,
+                    ),
+                )
+                del full_state_dict
+                dist.barrier()
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the

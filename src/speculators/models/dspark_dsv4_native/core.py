@@ -88,6 +88,9 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
     def __init__(self, config: DeepSeekV4NativeDSparkConfig) -> None:
         super().__init__(config=config)
         self.config = config
+        # Tell Trainer not to materialize/copy a normal full state_dict into
+        # DTensor parameters after FSDP. Native DSpark is too large for that path.
+        self.skip_fsdp_rank0_state_broadcast = True
         self.hidden_size = config.dim
         self.block_size = config.dspark_block_size
         self.verifier_vocab_size = config.vocab_size
