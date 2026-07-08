@@ -18,3 +18,4 @@ __all__ = [
     "PEagleDraftModel",
     "PEagleSpeculatorConfig",
 ]
+import speculators.models.dspark_dsv4_native  # noqa: F401

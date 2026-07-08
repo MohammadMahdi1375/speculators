@@ -410,6 +410,36 @@ def build_draft_model(
     extracts the native MTP head weights from the verifier, so the decoder-shaping
     flags and ``--draft-config`` do not apply.
     """
+    if args.speculator_type == "dspark_dsv4_native":
+        # Native DeepSeek-V4 DSpark builds official-style mtp.* blocks from
+        # the raw verifier config. Do not synthesize a Qwen/Llama draft decoder.
+        transformer_layer_config = get_verifier_config(args.verifier_name_or_path)
+        if hasattr(transformer_layer_config, "text_config"):
+            transformer_layer_config = transformer_layer_config.text_config
+
+        args.draft_vocab_size = draft_vocab_size
+        model = model_class.from_training_args(
+            verifier_config=transformer_layer_config,
+            t2d=t2d,
+            d2t=d2t,
+            **vars(args),
+        )
+
+        # For fine-tuning official HF DeepSeek-V4-Flash-DSpark, --from-pretrained
+        # points to the HF checkpoint containing mtp.* weights.
+        if args.from_pretrained:
+            if not hasattr(model, "load_mtp_weights_from_hf"):
+                raise TypeError(
+                    "dspark_dsv4_native model is missing load_mtp_weights_from_hf()"
+                )
+            logger.info(
+                "Loading native DeepSeek-V4 DSpark mtp.* weights from '%s'",
+                args.from_pretrained,
+            )
+            model.load_mtp_weights_from_hf(args.from_pretrained, strict=False)
+
+        return model
+
     if args.from_pretrained:
         if is_config_only_dir(args.from_pretrained):
             logger.info(
@@ -698,7 +728,17 @@ def main(args: argparse.Namespace):  # noqa: C901
         maybe_destroy_distributed()
         return
 
-    hidden_size = draft_model.config.transformer_layer_config.hidden_size
+    transformer_layer_config = getattr(draft_model.config, "transformer_layer_config", None)
+    hidden_size = getattr(transformer_layer_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(draft_model.config, "dim", None)
+    if hidden_size is None:
+        hidden_size = getattr(draft_model.config, "hidden_size", None)
+    if hidden_size is None:
+        raise AttributeError(
+            "Could not infer hidden size from draft_model.config; expected "
+            "transformer_layer_config.hidden_size, dim, or hidden_size."
+        )
 
     # Setup dataloaders
     preprocess_fns = {
@@ -980,7 +1020,7 @@ def parse_args():
         "--speculator-type",
         type=str,
         default="eagle3",
-        help="Type of speculator model to train (eagle3, dflash, dspark, peagle, mtp)",
+        help="Type of speculator model to train (eagle3, dflash, dspark, dspark_dsv4_native, peagle, mtp)",
     )
     parser.add_argument(
         "--from-pretrained",
