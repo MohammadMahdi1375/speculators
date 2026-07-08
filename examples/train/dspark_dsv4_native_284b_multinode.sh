@@ -178,6 +178,9 @@ print(f"OK local_rank={r}")
 PY
 done
 
+if [ "$PHASE" = "cache" ] || [ "$PHASE" = "all" ]; then
+    # Cache phase owns DATA_OUT and may overwrite it.
+    # Train phase must NOT overwrite DATA_OUT because that deletes hidden_states/.
 echo "=== [node $NODE_RANK] prepare_data ==="
 "$PY" scripts/prepare_data.py \
     --model "$MODEL" \
@@ -187,6 +190,15 @@ echo "=== [node $NODE_RANK] prepare_data ==="
     --seq-length "$SEQ_LENGTH" \
     --seed "$SEED" \
     --overwrite
+else
+    echo "=== [node $NODE_RANK] Skipping prepare_data for PHASE=$PHASE; reusing $DATA_OUT ==="
+    if [ ! -d "$DATA_OUT" ]; then
+        echo "ERROR: DATA_OUT does not exist: $DATA_OUT"
+        echo "Run cache phase first on both nodes."
+        exit 1
+    fi
+fi
+
 
 # Full-vocab native DSpark.  Do not train with draft/target vocab maps.
 rm -f "$DATA_OUT/d2t.npy" "$DATA_OUT/t2d.npy"
@@ -241,8 +253,45 @@ run_cache() {
         --seed "$SEED"
 }
 
+check_hidden_states_before_train() {
+    echo "=== [node $NODE_RANK] checking cached hidden states before train ==="
+    "$PY" - <<PY
+from pathlib import Path
+from datasets import load_from_disk
+import sys
+
+data_out = Path("$DATA_OUT")
+hs = Path("$HIDDEN_STATES_PATH")
+
+data = load_from_disk(str(data_out))
+n = len(data)
+
+have = set()
+if hs.exists():
+    for p in hs.glob("hs_*.safetensors"):
+        try:
+            have.add(int(p.stem.split("_")[1]))
+        except Exception:
+            pass
+
+missing = [i for i in range(n) if i not in have]
+
+print("DATA_OUT:", data_out)
+print("HIDDEN_STATES_PATH:", hs)
+print("dataset samples:", n)
+print("hidden-state files found:", len(have))
+print("missing count:", len(missing))
+print("missing first 50:", missing[:50])
+
+if missing:
+    print("ERROR: hidden-state cache is incomplete. Run cache phase first and verify missing count is 0.")
+    sys.exit(2)
+PY
+}
+
 run_train() {
     echo "=== [node $NODE_RANK] train native DSpark mtp.* ==="
+    check_hidden_states_before_train
     INIT_ARGS=()
     SHAPE_ARGS=(--num-layers "$NUM_MTP_LAYERS")
     if [ -n "$INIT_MTP_FROM" ]; then
