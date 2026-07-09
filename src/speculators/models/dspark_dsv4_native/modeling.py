@@ -9,6 +9,7 @@ can be trained inside the existing Speculators trainer on Ascend/NPU.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 import torch
@@ -199,6 +200,27 @@ class NativeDeepSeekV4MoE(nn.Module):
             expert_out = expert(x_flat[token_idx], weights[token_idx, which_top, None])
             y.index_add_(0, token_idx, expert_out.float())
         y = y + self.shared_experts(x_flat).float()
+
+        # FSDP/HCCL consistency for sparse MoE:
+        #
+        # Different ranks route tokens to different expert subsets. If an expert
+        # receives zero tokens on one rank, its parameters may not participate in
+        # backward on that rank, while they do participate on another rank. With
+        # FSDP this causes inconsistent HCCL ReduceScatter counts.
+        #
+        # Add a zero-valued autograd edge to every routed expert parameter so all
+        # ranks produce gradients for the same parameter set. This does not
+        # change the forward output.
+        if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS", "1") != "0":
+            touch = None
+            for expert in self.experts:
+                for param in expert.parameters():
+                    term = param.reshape(-1)[:1].float().sum()
+                    touch = term if touch is None else touch + term
+
+            if touch is not None:
+                y = y + touch.to(y.dtype) * 0.0
+
         return y.to(x.dtype).view(shape)
 
 
