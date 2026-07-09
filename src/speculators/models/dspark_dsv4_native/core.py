@@ -380,8 +380,20 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
                     pos = torch.cat([pos, pos.new_zeros(pad)])
                     valid = torch.cat([valid, valid.new_zeros(pad)])
             else:
+                # Architecture-preserving smoke fallback:
+                # Some ranks may receive samples with no valid trainable anchors.
+                # Returning all-invalid anchors can create a detached zero loss on
+                # that rank while other ranks run the full DSpark graph, causing
+                # HCCL collectives to hang. For smoke/debug training, force one
+                # valid fallback anchor so every rank executes the same graph.
+                #
+                # This does not change the drafter architecture. Disable with:
+                #   DSPARK_NATIVE_FORCE_VALID_ANCHOR=0
+                import os as _os
                 pos = torch.zeros(self.config.max_anchors, device=input_ids.device, dtype=torch.long)
                 valid = torch.zeros(self.config.max_anchors, device=input_ids.device, dtype=torch.bool)
+                if self.training and _os.environ.get("DSPARK_NATIVE_FORCE_VALID_ANCHOR", "1") != "0":
+                    valid[0] = True
             all_positions.append(pos)
             all_valid.append(valid)
         return torch.stack(all_positions, dim=0), torch.stack(all_valid, dim=0)
@@ -452,10 +464,10 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
         loss_fn: str,
         confidence_head_alpha: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if valid_mask.sum() <= 0:
-            zero = logits.sum() * 0.0
-            return zero, {"loss": zero.detach(), "num_valid": valid_mask.sum().detach()}
-
+        # Do not early-return a detached zero loss when this rank has no valid
+        # anchors. That creates a rank-dependent backward graph and can hang
+        # HCCL. The smoke fallback in _select_anchors should make at least one
+        # valid anchor available per sample/rank.
         draft_logp = F.log_softmax(logits.float(), dim=-1)
         target_p = F.softmax(target_logits.float(), dim=-1)
         target_logp = F.log_softmax(target_logits.float(), dim=-1)
@@ -475,6 +487,15 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
         draft_loss = _masked_mean(token_loss, valid_mask)
         conf_loss = _masked_mean(confidence_loss, valid_mask)
         loss = draft_loss + confidence_head_alpha * conf_loss
+
+        # FSDP/HCCL consistency without changing DSpark architecture:
+        # Keep logits and confidence logits connected to the scalar loss on
+        # every rank. These terms are zero-valued, so the objective is unchanged.
+        import os as _os
+        if self.training and _os.environ.get("DSPARK_NATIVE_TOUCH_CONFIDENCE_LOSS", "1") != "0":
+            loss = loss + confidence_logits.float().sum() * 0.0
+        if self.training and _os.environ.get("DSPARK_NATIVE_TOUCH_FULL_LOGITS_LOSS", "1") != "0":
+            loss = loss + logits.float().sum() * 0.0
         greedy = logits.argmax(dim=-1)
         acc = _masked_mean((greedy == target_token_ids).float(), valid_mask)
         metrics = {
