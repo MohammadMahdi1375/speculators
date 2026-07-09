@@ -273,6 +273,29 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
                 verifier=VerifierConfig.from_pretrained(verifier_name),
             ),
         )
+        # Optional smoke-test overrides. These let us prove the native DSpark
+        # train loop with fewer MTP layers / routed experts before using the
+        # exact full HF architecture.
+        if os.environ.get("DSPARK_NATIVE_NUM_MTP_LAYERS"):
+            cfg.n_mtp_layers = int(os.environ["DSPARK_NATIVE_NUM_MTP_LAYERS"])
+
+        if os.environ.get("DSPARK_NATIVE_N_ROUTED_EXPERTS"):
+            cfg.n_routed_experts = int(os.environ["DSPARK_NATIVE_N_ROUTED_EXPERTS"])
+            cfg.n_activated_experts = min(cfg.n_activated_experts, cfg.n_routed_experts)
+
+        if os.environ.get("DSPARK_NATIVE_N_ACTIVATED_EXPERTS"):
+            cfg.n_activated_experts = int(os.environ["DSPARK_NATIVE_N_ACTIVATED_EXPERTS"])
+            cfg.n_activated_experts = min(cfg.n_activated_experts, cfg.n_routed_experts)
+
+        logger.info(
+            "[native-dspark] effective config: n_mtp_layers=%s "
+            "n_routed_experts=%s n_activated_experts=%s block_size=%s",
+            cfg.n_mtp_layers,
+            cfg.n_routed_experts,
+            cfg.n_activated_experts,
+            cfg.dspark_block_size,
+        )
+
         model = cls(config=cfg)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
