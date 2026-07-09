@@ -576,4 +576,13 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
             confidence_head_alpha=confidence_head_alpha,
         )
         draft_tokens = logits.argmax(dim=-1)
+        # FSDP/HCCL consistency:
+        # Some batches/ranks may mask out confidence loss, which leaves
+        # confidence_head.proj.weight unused on those ranks. Its parameter count is
+        # 4352 = hidden_size 4096 + markov_rank 256, matching the observed
+        # ReduceScatter count mismatch. Keep a zero-valued edge from confidence
+        # logits to loss so the confidence head participates on every rank.
+        if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_CONFIDENCE_LOGITS", "1") != "0":
+            loss = loss + confidence_logits.float().sum() * 0.0
+
         return draft_tokens, loss, metrics
