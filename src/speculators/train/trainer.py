@@ -224,7 +224,24 @@ class Trainer:
         elif not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
-        apply_fully_sharded(self.model)
+        if native_dspark_large and os.environ.get("DSPARK_NATIVE_FSDP2_EXPERT_WRAP", "0") == "1":
+            if dist.get_rank() == 0:
+                print(
+                    "[native-dspark] using expert-aware FSDP2 wrapping",
+                    flush=True,
+                )
+
+            from speculators.models.dspark_dsv4_native.fsdp2_plan import (
+                apply_native_dspark_expert_fsdp2,
+            )
+
+            plan_info = apply_native_dspark_expert_fsdp2(self.model)
+
+            if dist.get_rank() == 0:
+                print(f"[native-dspark] FSDP2 expert plan: {plan_info}", flush=True)
+
+        else:
+            apply_fully_sharded(self.model)
 
         # Verifier modules are excluded from FSDP (see apply_fully_sharded),
         # so move them to the local device explicitly; otherwise the

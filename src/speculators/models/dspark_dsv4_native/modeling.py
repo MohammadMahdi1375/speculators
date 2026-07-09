@@ -203,20 +203,34 @@ class NativeDeepSeekV4MoE(nn.Module):
 
         # FSDP/HCCL consistency for sparse MoE:
         #
-        # Different ranks route tokens to different expert subsets. If an expert
-        # receives zero tokens on one rank, its parameters may not participate in
-        # backward on that rank, while they do participate on another rank. With
-        # FSDP this causes inconsistent HCCL ReduceScatter counts.
+        # Different ranks may route tokens to different expert subsets. For
+        # distributed training, especially with FSDP2/HCCL, every rank should
+        # keep the same expert parameter set in the autograd graph.
         #
-        # Add a zero-valued autograd edge to every routed expert parameter so all
-        # ranks produce gradients for the same parameter set. This does not
-        # change the forward output.
+        # mode=forward calls every expert on a tiny activation so each expert's
+        # FSDP2 hooks run on every rank. The contribution is zero-valued, so the
+        # model output/objective is unchanged.
         if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS", "1") != "0":
             touch = None
-            for expert in self.experts:
-                for param in expert.parameters():
-                    term = param.reshape(-1)[:1].float().sum()
+            mode = os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS_MODE", "param")
+
+            if mode == "forward":
+                if x_flat.shape[0] > 0:
+                    z = x_flat[:1]
+                else:
+                    z = torch.zeros(
+                        (1, x_flat.shape[-1]),
+                        dtype=x_flat.dtype,
+                        device=x_flat.device,
+                    )
+                for expert in self.experts:
+                    term = expert(z).float().sum()
                     touch = term if touch is None else touch + term
+            else:
+                for expert in self.experts:
+                    for param in expert.parameters():
+                        term = param.reshape(-1)[:1].float().sum()
+                        touch = term if touch is None else touch + term
 
             if touch is not None:
                 y = y + touch.to(y.dtype) * 0.0
