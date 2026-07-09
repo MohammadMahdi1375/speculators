@@ -298,35 +298,6 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
 
         model = cls(config=cfg)
 
-        # Smoke-test stability on FSDP/HCCL:
-
-        # confidence_head.proj.weight has 4352 params = 4096 hidden + 256 markov.
-
-        # It is the exact remaining ReduceScatter count mismatch. Freeze it for
-
-        # reduced smoke runs; set DSPARK_NATIVE_FREEZE_CONFIDENCE_HEAD=0 later to train it.
-
-        if os.environ.get("DSPARK_NATIVE_FREEZE_CONFIDENCE_HEAD", "1") != "0":
-
-            frozen_conf_params = 0
-
-            for name, param in model.named_parameters():
-
-                if ".confidence_head." in name or name.startswith("confidence_head."):
-
-                    param.requires_grad_(False)
-
-                    frozen_conf_params += param.numel()
-
-            logger.warning(
-
-                "[native-dspark] froze confidence head params for smoke/FSDP stability: %s",
-
-                frozen_conf_params,
-
-            )
-
-
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
         return model
@@ -614,5 +585,16 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
         # logits to loss so the confidence head participates on every rank.
         if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_CONFIDENCE_LOGITS", "1") != "0":
             loss = loss + confidence_logits.float().sum() * 0.0
+
+        # FSDP/HCCL consistency without changing DSpark architecture:
+
+        # Keep confidence_logits connected to the scalar loss on every rank.
+
+        # This is a zero-valued term, so it does not alter the objective.
+
+        if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_CONFIDENCE_LOSS", "1") != "0":
+
+            loss = loss + confidence_logits.float().sum() * 0.0
+
 
         return draft_tokens, loss, metrics

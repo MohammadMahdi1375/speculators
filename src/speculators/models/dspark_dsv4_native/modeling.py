@@ -483,6 +483,27 @@ class NativeDSparkBlock(nn.Module):
             logits, confidence_logits, hidden = self.forward_head_teacher(
                 x, anchor_ids, prev_token_ids, head
             )
+
+            # FSDP/HCCL consistency without changing DSpark architecture:
+
+            # Always keep confidence_head.proj.weight in the autograd graph.
+
+            # The added value is zero, so confidence logits and loss are unchanged.
+
+            if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_CONFIDENCE_HEAD", "1") != "0":
+
+                _conf_touch = None
+
+                for _p in self.confidence_head.parameters():
+
+                    _term = _p.reshape(-1)[:1].float().sum()
+
+                    _conf_touch = _term if _conf_touch is None else _conf_touch + _term
+
+                if _conf_touch is not None:
+
+                    confidence_logits = confidence_logits + _conf_touch.to(confidence_logits.dtype) * 0.0
+
             if return_embed:
                 return x, main_x, input_ids, logits, confidence_logits, hidden
             return x, logits, confidence_logits, hidden
