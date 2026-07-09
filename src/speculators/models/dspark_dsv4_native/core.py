@@ -484,23 +484,65 @@ class DeepSeekV4NativeDSparkModel(SpeculatorModel):
             position_ids=position_ids,
         )
 
-        x, main_x, draft_input_ids = self.mtp[0].forward_embed(
-            gathered.main_hidden_context, gathered.anchor_ids, self.embed_tokens
-        )
-        for layer in self.mtp:
-            x = layer(
+        # Important for FSDP/DTensor:
+        # Do not call custom methods like forward_embed() or
+        # forward_head_teacher() directly on sharded modules. Those bypass
+        # FSDP forward hooks and cause mixed torch.Tensor/DTensor matmul errors.
+        if len(self.mtp) == 1:
+            (
+                x,
+                main_x,
+                draft_input_ids,
+                logits,
+                confidence_logits,
+                _hidden,
+            ) = self.mtp[0](
+                x=None,
+                input_ids=None,
+                main_x=None,
+                main_position_ids=gathered.main_position_ids,
+                draft_position_ids=gathered.draft_position_ids,
+                main_hidden=gathered.main_hidden_context,
+                anchor_ids=gathered.anchor_ids,
+                embed=self.embed_tokens,
+                return_embed=True,
+                prev_token_ids=gathered.prev_token_ids,
+                head=self.lm_head,
+                return_head=True,
+            )
+        else:
+            x, main_x, draft_input_ids = self.mtp[0](
+                x=None,
+                input_ids=None,
+                main_x=None,
+                main_position_ids=gathered.main_position_ids,
+                draft_position_ids=gathered.draft_position_ids,
+                main_hidden=gathered.main_hidden_context,
+                anchor_ids=gathered.anchor_ids,
+                embed=self.embed_tokens,
+                return_embed=True,
+            )
+
+            for layer in self.mtp[1:-1]:
+                x = layer(
+                    x,
+                    draft_input_ids,
+                    main_x,
+                    gathered.main_position_ids,
+                    gathered.draft_position_ids,
+                )
+
+            x, logits, confidence_logits, _hidden = self.mtp[-1](
                 x,
                 draft_input_ids,
                 main_x,
                 gathered.main_position_ids,
                 gathered.draft_position_ids,
+                anchor_ids=gathered.anchor_ids,
+                prev_token_ids=gathered.prev_token_ids,
+                head=self.lm_head,
+                return_head=True,
             )
-        logits, confidence_logits, _hidden = self.mtp[-1].forward_head_teacher(
-            x,
-            gathered.anchor_ids,
-            gathered.prev_token_ids,
-            self.lm_head,
-        )
         loss, metrics = self._loss_and_metrics(
             logits=logits,
             target_logits=gathered.target_logits,

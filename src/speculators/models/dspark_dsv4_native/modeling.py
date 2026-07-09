@@ -403,23 +403,71 @@ class NativeDSparkBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
-        main_x: torch.Tensor,
-        main_position_ids: torch.Tensor,
-        draft_position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        x: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        main_x: torch.Tensor | None = None,
+        main_position_ids: torch.Tensor | None = None,
+        draft_position_ids: torch.Tensor | None = None,
+        *,
+        main_hidden: torch.Tensor | None = None,
+        anchor_ids: torch.Tensor | None = None,
+        embed: nn.Embedding | None = None,
+        return_embed: bool = False,
+        prev_token_ids: torch.Tensor | None = None,
+        head: nn.Linear | None = None,
+        return_head: bool = False,
+    ):
+        """Run DSpark block through normal forward() so FSDP hooks fire.
+
+        FSDP/DTensor hooks are attached to module.__call__/forward. Calling
+        custom methods like forward_embed() or forward_head_teacher() directly
+        can leave weights as DTensors and activations as normal torch.Tensor,
+        causing mixed Tensor/DTensor matmul errors.
+        """
+
+        if return_embed:
+            if main_hidden is None or anchor_ids is None or embed is None:
+                raise ValueError(
+                    "return_embed=True requires main_hidden, anchor_ids, and embed"
+                )
+            x, main_x, input_ids = self.forward_embed(main_hidden, anchor_ids, embed)
+
+        if x is None or input_ids is None or main_x is None:
+            raise ValueError("x, input_ids, and main_x must be provided")
+        if main_position_ids is None or draft_position_ids is None:
+            raise ValueError("main_position_ids and draft_position_ids must be provided")
+
         residual = x
-        y, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        y, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
         y = self.attn_norm(y)
         y = self.attn(y, main_x, main_position_ids, draft_position_ids)
         x = self.hc_post(y, residual, post, comb)
 
         residual = x
-        y, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        y, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
         y = self.ffn_norm(y)
         y = self.ffn(y, input_ids)
         x = self.hc_post(y, residual, post, comb)
+
+        if return_head:
+            if anchor_ids is None or prev_token_ids is None or head is None:
+                raise ValueError(
+                    "return_head=True requires anchor_ids, prev_token_ids, and head"
+                )
+            logits, confidence_logits, hidden = self.forward_head_teacher(
+                x, anchor_ids, prev_token_ids, head
+            )
+            if return_embed:
+                return x, main_x, input_ids, logits, confidence_logits, hidden
+            return x, logits, confidence_logits, hidden
+
+        if return_embed:
+            return x, main_x, input_ids
+
         return x
 
     def forward_head_teacher(
