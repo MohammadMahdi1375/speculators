@@ -13,6 +13,7 @@ import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
@@ -192,49 +193,94 @@ class NativeDeepSeekV4MoE(nn.Module):
         ids_flat = input_ids.reshape(-1)
         weights, indices = self.gate(x_flat, ids_flat)
         y = torch.zeros_like(x_flat, dtype=torch.float32)
-        counts = torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts)
-        for expert_id, expert in enumerate(self.experts):
-            if int(counts[expert_id].item()) == 0:
-                continue
-            token_idx, which_top = torch.where(indices == expert_id)
-            expert_out = expert(x_flat[token_idx], weights[token_idx, which_top, None])
-            y.index_add_(0, token_idx, expert_out.float())
-        y = y + self.shared_experts(x_flat).float()
 
-        # FSDP/HCCL consistency for sparse MoE:
-        #
-        # Different ranks may route tokens to different expert subsets. For
-        # distributed training, especially with FSDP2/HCCL, every rank should
-        # keep the same expert parameter set in the autograd graph.
-        #
-        # mode=forward calls every expert on a tiny activation so each expert's
-        # FSDP2 hooks run on every rank. The contribution is zero-valued, so the
-        # model output/objective is unchanged.
-        if self.training and os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS", "1") != "0":
-            touch = None
-            mode = os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS_MODE", "param")
+        touch_enabled = (
+            self.training
+            and os.environ.get("DSPARK_NATIVE_TOUCH_ALL_EXPERTS", "1") != "0"
+        )
+        touch_mode = os.environ.get(
+            "DSPARK_NATIVE_TOUCH_ALL_EXPERTS_MODE", "union_forward"
+        )
 
-            if mode == "forward":
-                if x_flat.shape[0] > 0:
-                    z = x_flat[:1]
+        # Architecture-preserving FSDP2/HCCL consistency:
+        #
+        # Sparse MoE means different ranks may select different experts. With
+        # per-expert FSDP2, all ranks must call the same expert FSDP modules in
+        # the same order. union_forward computes the global union of experts
+        # used by any rank, then calls exactly that union on every rank.
+        #
+        # This preserves the MoE architecture and real expert routing. Experts
+        # not selected locally are called on a tiny dummy activation and their
+        # contribution is multiplied by zero.
+        if touch_enabled and touch_mode in ("union_forward", "forward"):
+            if touch_mode == "forward":
+                global_mask = torch.ones(
+                    self.n_routed_experts,
+                    device=x_flat.device,
+                    dtype=torch.int32,
+                )
+            else:
+                global_mask = torch.zeros(
+                    self.n_routed_experts,
+                    device=x_flat.device,
+                    dtype=torch.int32,
+                )
+                if indices.numel() > 0:
+                    global_mask.scatter_(
+                        0,
+                        indices.reshape(-1).to(torch.long),
+                        1,
+                    )
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(global_mask, op=dist.ReduceOp.MAX)
+
+            for expert_id, expert in enumerate(self.experts):
+                if int(global_mask[expert_id].item()) == 0:
+                    continue
+
+                token_idx, which_top = torch.where(indices == expert_id)
+
+                if token_idx.numel() > 0:
+                    expert_out = expert(
+                        x_flat[token_idx],
+                        weights[token_idx, which_top, None],
+                    )
+                    y.index_add_(0, token_idx, expert_out.float())
                 else:
-                    z = torch.zeros(
-                        (1, x_flat.shape[-1]),
+                    # Dummy call so this expert's FSDP2 hooks fire on this rank.
+                    z = x_flat[:1] if x_flat.shape[0] > 0 else torch.zeros(
+                        (1, self.dim),
                         dtype=x_flat.dtype,
                         device=x_flat.device,
                     )
-                for expert in self.experts:
-                    term = expert(z).float().sum()
-                    touch = term if touch is None else touch + term
-            else:
+                    touch = expert(z).float().sum()
+                    y = y + touch.to(y.dtype) * 0.0
+
+        else:
+            counts = torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts)
+            for expert_id, expert in enumerate(self.experts):
+                if int(counts[expert_id].item()) == 0:
+                    continue
+                token_idx, which_top = torch.where(indices == expert_id)
+                expert_out = expert(
+                    x_flat[token_idx],
+                    weights[token_idx, which_top, None],
+                )
+                y.index_add_(0, token_idx, expert_out.float())
+
+            if touch_enabled:
+                # Lightweight fallback mode: keeps params in graph, but does not
+                # trigger per-expert FSDP2 forward hooks. Do not use this mode for
+                # 256-expert FSDP2 runs unless debugging.
+                touch = None
                 for expert in self.experts:
                     for param in expert.parameters():
                         term = param.reshape(-1)[:1].float().sum()
                         touch = term if touch is None else touch + term
+                if touch is not None:
+                    y = y + touch.to(y.dtype) * 0.0
 
-            if touch is not None:
-                y = y + touch.to(y.dtype) * 0.0
-
+        y = y + self.shared_experts(x_flat).float()
         return y.to(x.dtype).view(shape)
 
 
