@@ -3,8 +3,21 @@
 # Native DeepSeek-V4-Flash DSpark, 2-node NPU training.
 #
 # Parent 80.5.5.108:
-#   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 cache
-#   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 train
+#   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 cache\
+    # LOG_FILTER=0 \
+    # MAX_ANCHORS=128 \
+    # NUM_MTP_LAYERS=3 \
+    # DSPARK_NATIVE_N_ROUTED_EXPERTS=256 \
+    # DSPARK_NATIVE_N_ACTIVATED_EXPERTS=6 \
+    # DSPARK_NATIVE_FSDP2_EXPERT_WRAP=1 \
+    # DSPARK_NATIVE_TOUCH_ALL_EXPERTS=1 \
+    # DSPARK_NATIVE_TOUCH_ALL_EXPERTS_MODE=forward \
+    # DSPARK_NATIVE_TOUCH_CONFIDENCE_HEAD=1 \
+    # DSPARK_NATIVE_TOUCH_CONFIDENCE_LOSS=1 \
+    # DSPARK_NATIVE_TOUCH_FULL_LOGITS_LOSS=1 \
+    # DSPARK_NATIVE_FORCE_VALID_ANCHOR=0 \
+    # bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 train \
+    # 2>&1 | tee ./logs/native_train_dspark_full.log
 #   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 export
 #
 # Child 80.5.5.109:
@@ -114,7 +127,7 @@ DATA_OUT="${DATA_OUT:-/home/n84449292/m84379596/dspark_dsv4_native_multinode}"
 HIDDEN_STATES_PATH="$DATA_OUT/hidden_states"
 SHARED_STORAGE_PATH="${SHARED_STORAGE_PATH:-/dev/shm/hidden_states}"
 
-MAX_SAMPLES="${MAX_SAMPLES:-32}"
+MAX_SAMPLES="${MAX_SAMPLES:-10000}"
 SEQ_LENGTH="${SEQ_LENGTH:-1024}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-5}"
