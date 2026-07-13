@@ -3,7 +3,7 @@
 # Native DeepSeek-V4-Flash DSpark, 2-node NPU training.
 #
 # Parent 80.5.5.108:
-#   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 cache\
+#   bash examples/train/dspark_dsv4_native_284b_multinode.sh 0 cache
     # LOG_FILTER=0 \
     # MAX_ANCHORS=128 \
     # NUM_MTP_LAYERS=3 \
@@ -118,6 +118,9 @@ fi
 LOCAL_IP="$(ip -o -4 addr show dev "$NET_IFACE" | awk -v ip="$EXPECTED_IP" '{split($4,a,"/"); if (a[1] == ip) {print a[1]; exit}}')"
 export GLOO_SOCKET_IFNAME="$NET_IFACE"
 export HCCL_SOCKET_IFNAME="$NET_IFACE"
+export HCCL_SOCKET_FAMILY=AF_INET
+export HCCL_IF_IP="$LOCAL_IP"
+export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-17777}"
 export TP_SOCKET_IFNAME="$NET_IFACE"
 
 # ===================== data/model =====================
@@ -127,7 +130,7 @@ DATA_OUT="${DATA_OUT:-/home/n84449292/m84379596/dspark_dsv4_native_multinode}"
 HIDDEN_STATES_PATH="$DATA_OUT/hidden_states"
 SHARED_STORAGE_PATH="${SHARED_STORAGE_PATH:-/dev/shm/hidden_states}"
 
-MAX_SAMPLES="${MAX_SAMPLES:-10000}"
+MAX_SAMPLES="${MAX_SAMPLES:-100000}"
 SEQ_LENGTH="${SEQ_LENGTH:-1024}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-5}"
