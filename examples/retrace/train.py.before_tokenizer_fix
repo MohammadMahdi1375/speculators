@@ -1,0 +1,368 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+"""Train a baseline or finetune ReTrace using real DSpARK verification rounds."""
+
+import argparse
+import copy
+import importlib.metadata
+import json
+import math
+from pathlib import Path
+import random
+import subprocess
+import sys
+
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from speculators import DSparkDraftModel, DSparkSpeculatorConfig
+from speculators.config import SpeculatorsConfig, VerifierConfig
+from speculators.models.dspark.retrace import ReTraceConditioner
+from speculators.models.dspark.retrace_training import distillation_loss, validate_draft
+from speculators.proposals.greedy import GreedyTokenProposalConfig
+
+from runner import generate, greedy_target
+
+
+def device_for(name):
+    if name.startswith("npu"):
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(name)
+    return torch.device(name)
+
+
+def read_prompts(path, tokenizer, limit, max_length):
+    prompts = []
+    with open(path, encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if "input_ids" in row:
+                ids = row["input_ids"]
+            else:
+                messages = row.get("messages")
+                if messages is None:
+                    if not isinstance(row.get("prompt"), str):
+                        raise ValueError(
+                            f"Line {line_no}: need prompt, messages, or input_ids"
+                        )
+                    messages = [{"role": "user", "content": row["prompt"]}]
+                ids = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            if not ids or any(
+                not isinstance(i, int) or i < 0 or i >= len(tokenizer) for i in ids
+            ):
+                raise ValueError(f"Line {line_no}: invalid token ids")
+            # Skip overlength prompts rather than truncating a chat template.
+            if len(ids) <= max_length:
+                prompts.append(ids)
+            if limit and len(prompts) >= limit:
+                break
+    if not prompts:
+        raise ValueError("No nonempty prompts fit --prompt-length")
+    return prompts
+
+
+def make_draft(args, target):
+    if args.draft:
+        config = DSparkSpeculatorConfig.from_pretrained(
+            args.draft, local_files_only=True
+        )
+        if config.speculators_config.verifier.name_or_path != args.target:
+            config.speculators_config.verifier.name_or_path = args.target
+        # Load trained weights under their existing architecture first; then add
+        # the new module explicitly so HF cannot initialize its zero matrix away.
+        model = DSparkDraftModel.from_pretrained(
+            args.draft, config=config, local_files_only=True
+        )
+    else:
+        if args.mode != "base":
+            raise ValueError(
+                "ReTrace finetuning requires --draft from a trained DSpARK baseline"
+            )
+        layer_config = copy.deepcopy(target.config)
+        layer_config.num_hidden_layers = args.num_layers
+        layer_config.layer_types = ["full_attention"] * args.num_layers
+        layer_config._attn_implementation = "eager"
+        layer_config.attention_dropout = 0.0
+        aux_ids = args.target_layer_ids or [
+            2,
+            target.config.num_hidden_layers // 2,
+            target.config.num_hidden_layers - 3,
+        ]
+        if (
+            not aux_ids
+            or min(aux_ids) < 0
+            or max(aux_ids) >= target.config.num_hidden_layers
+        ):
+            raise ValueError(
+                "Use auxiliary hidden-state indices below the final target layer"
+            )
+        k = args.block_size if args.sample_from_anchor else args.block_size - 1
+        config = DSparkSpeculatorConfig(
+            transformer_layer_config=layer_config,
+            draft_vocab_size=target.config.vocab_size,
+            block_size=args.block_size,
+            aux_hidden_state_layer_ids=aux_ids,
+            sample_from_anchor=args.sample_from_anchor,
+            mask_token_id=args.mask_token_id,
+            markov_rank=args.markov_rank,
+            markov_head_type="vanilla",
+            enable_confidence_head=True,
+            confidence_head_with_markov=True,
+            speculators_config=SpeculatorsConfig(
+                algorithm="dspark",
+                proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=k)],
+                default_proposal_method="greedy",
+                verifier=VerifierConfig.from_pretrained(args.target),
+            ),
+        )
+        model = DSparkDraftModel(config)
+    if not (0 <= model.mask_token_id < target.config.vocab_size):
+        raise ValueError("mask_token_id must be a real row in the target embedding")
+    if model.hidden_size != target.config.hidden_size:
+        raise ValueError(
+            "Draft and target hidden dimensions must match in this Qwen3 port"
+        )
+    validate_draft(model)
+    if args.mode == "retrace" and model.retrace is None:
+        model.retrace = ReTraceConditioner(model.hidden_size)
+        model.config.retrace_enabled = True
+    if args.mode == "base" and model.config.retrace_enabled:
+        raise ValueError("Base mode needs an unconditioned baseline checkpoint")
+    # Avoid duplicate allocations for frozen target-owned tensors.
+    model.embed_tokens = target.model.embed_tokens
+    model.lm_head = target.lm_head
+    model.verifier_lm_head = target.lm_head
+    model.verifier_norm = target.model.norm
+    for layer in model.layers:
+        layer.self_attn.config._attn_implementation = "eager"
+    model.config.transformer_layer_config._attn_implementation = "eager"
+    model.to(device=target.device, dtype=target.dtype)
+    return model
+
+
+def save_checkpoint(model, optimizer, output, step, args):
+    dest = output / f"step_{step:06d}"
+    dest.mkdir(parents=True, exist_ok=False)
+    model.save_pretrained(dest, safe_serialization=True)
+    torch.save(optimizer.state_dict(), dest / "optimizer.pt")
+    (dest / "training_state.json").write_text(
+        json.dumps({"optimizer_step": step, "args": vars(args)}, indent=2)
+    )
+    (output / "latest.txt").write_text(str(dest.resolve()) + "\n")
+    print(f"Checkpoint: {dest}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", required=True)
+    parser.add_argument(
+        "--data", required=True, help="Local JSONL prompts/messages/input_ids"
+    )
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--draft", help="Local speculators-format DSpARK checkpoint")
+    parser.add_argument("--mode", choices=("base", "retrace"), default="retrace")
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    parser.add_argument(
+        "--block-size", type=int, default=16, help="Query slots including anchor"
+    )
+    parser.add_argument(
+        "--sample-from-anchor",
+        action="store_true",
+        help="Condition anchor predictor too (DSpARK extension)",
+    )
+    parser.add_argument("--mask-token-id", type=int, default=151669)
+    parser.add_argument("--num-layers", type=int, default=5)
+    parser.add_argument("--target-layer-ids", type=int, nargs="+")
+    parser.add_argument("--markov-rank", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--max-steps", type=int, default=5000)
+    parser.add_argument("--max-prompts", type=int, default=40000)
+    parser.add_argument("--prompt-length", type=int, default=512)
+    parser.add_argument("--response-length", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--grad-accum-rounds", type=int, default=8)
+    parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--check-greedy",
+        action="store_true",
+        help="Check first prompt against target-only generation before training",
+    )
+    args = parser.parse_args()
+    for name in (
+        "epochs",
+        "max_steps",
+        "grad_accum_rounds",
+        "save_every",
+        "response_length",
+        "num_layers",
+    ):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.block_size < 2:
+        parser.error("--block-size must include at least anchor + one mask")
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    if (output / "train_command.txt").exists():
+        raise ValueError(
+            "Use a new output directory; existing training artifacts will not be overwritten"
+        )
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = device_for(args.device)
+    if device.type == "npu":
+        torch.npu.manual_seed_all(args.seed)
+    versions = {}
+    for package in (
+        "torch",
+        "torch-npu",
+        "transformers",
+        "speculators",
+        "vllm",
+        "vllm-ascend",
+    ):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    repo = Path(__file__).resolve().parents[2]
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    (output / "train_command.txt").write_text(
+        json.dumps({"argv": sys.argv, "git_sha": sha, "versions": versions}, indent=2)
+    )
+    patch = subprocess.run(
+        ["git", "-C", str(repo), "diff", "HEAD"], capture_output=True, text=True
+    ).stdout
+    (output / "speculators.patch").write_text(patch)
+    tokenizer = AutoTokenizer.from_pretrained(args.target, local_files_only=True)
+    target_config = AutoConfig.from_pretrained(args.target, local_files_only=True)
+    if target_config.model_type != "qwen3":
+        raise ValueError("This runner supports the dense Qwen3 target architecture")
+    target = (
+        AutoModelForCausalLM.from_pretrained(
+            args.target,
+            dtype=getattr(torch, args.dtype),
+            attn_implementation="eager",
+            local_files_only=True,
+        )
+        .to(device)
+        .eval()
+        .requires_grad_(False)
+    )
+    draft = make_draft(args, target)
+    prompts = read_prompts(args.data, tokenizer, args.max_prompts, args.prompt_length)
+    eos = target.generation_config.eos_token_id
+    eos = set(eos if isinstance(eos, list) else [eos]) if eos is not None else set()
+    if args.check_greedy:
+        draft.eval()
+        ids = torch.tensor([prompts[0]], device=device)
+        expected = greedy_target(target, ids, min(64, args.response_length), eos)
+        actual = generate(
+            target, draft, ids, min(64, args.response_length), eos
+        ).token_ids
+        if expected != actual:
+            raise RuntimeError(
+                "Greedy parity failed. Inspect first mismatching token before training."
+            )
+        print("Greedy parity passed", flush=True)
+    draft.train()
+    parameters = [p for p in draft.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        parameters, lr=args.lr, weight_decay=args.weight_decay, foreach=False
+    )
+    step, accumulated, saved_step = 0, 0, -1
+    lr_warmup = max(1, int(0.05 * args.max_steps))
+    log = open(output / "metrics.jsonl", "a", encoding="utf-8")
+
+    def current_beta():
+        warmup = draft.config.retrace_warmup_steps
+        return draft.config.retrace_beta_max * (
+            min(step / warmup, 1.0) if warmup else 1.0
+        )
+
+    def optimize(proposal, target_logits, valid, accepted):
+        nonlocal step, accumulated, saved_step
+        loss, metrics = distillation_loss(proposal, target_logits, valid)
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(
+                "Nonfinite loss; checkpoint and environment need inspection"
+            )
+        (loss / args.grad_accum_rounds).backward()
+        accumulated += 1
+        if accumulated < args.grad_accum_rounds:
+            return True
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+        scale = min((step + 1) / lr_warmup, 1.0)
+        if step >= lr_warmup:
+            progress = (step - lr_warmup) / max(1, args.max_steps - lr_warmup)
+            scale = 0.5 * (1 + math.cos(math.pi * progress))
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr * scale
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        step += 1
+        accumulated = 0
+        metrics.update(
+            step=step,
+            last_round_accepted=accepted,
+            beta=current_beta(),
+            lr=args.lr * scale,
+        )
+        log.write(json.dumps(metrics) + "\n")
+        log.flush()
+        print(json.dumps(metrics), flush=True)
+        if step % args.save_every == 0:
+            save_checkpoint(draft, optimizer, output, step, args)
+            saved_step = step
+        return step < args.max_steps
+
+    try:
+        for _ in range(args.epochs):
+            random.shuffle(prompts)
+            for prompt in prompts:
+                generate(
+                    target,
+                    draft,
+                    torch.tensor([prompt], device=device),
+                    args.response_length,
+                    eos,
+                    optimize,
+                    current_beta,
+                )
+                if step >= args.max_steps:
+                    break
+            if step >= args.max_steps:
+                break
+        # Apply a final partial accumulation with its actual normalization.
+        if accumulated:
+            for p in parameters:
+                if p.grad is not None:
+                    p.grad.mul_(args.grad_accum_rounds / accumulated)
+            torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+        if saved_step != step:
+            save_checkpoint(draft, optimizer, output, step, args)
+        if step == 0:
+            raise RuntimeError(
+                "No training rounds: inspect prompts, EOS, and response length"
+            )
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    main()

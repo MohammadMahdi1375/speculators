@@ -40,10 +40,14 @@ from .models import (
     MTPSpeculatorConfig,
     PEagleDraftModel,
     PEagleSpeculatorConfig,
+    ReTraceDraftModel,
+    ReTraceSpeculatorConfig,
 )
 from .proposals import TokenProposalConfig
 
 __all__ = [
+    "ReTraceDraftModel",
+    "ReTraceSpeculatorConfig",
     "DFlash2DraftModel",
     "DFlash2SpeculatorConfig",
     "DFlashDraftModel",

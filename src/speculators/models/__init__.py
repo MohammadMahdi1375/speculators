@@ -6,8 +6,11 @@ from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
+from .retrace import ReTraceDraftModel, ReTraceSpeculatorConfig
 
 __all__ = [
+    "ReTraceDraftModel",
+    "ReTraceSpeculatorConfig",
     "DFlash2DraftModel",
     "DFlash2SpeculatorConfig",
     "DFlashDraftModel",
