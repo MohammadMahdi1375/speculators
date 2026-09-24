@@ -28,6 +28,7 @@ _ADAMW_NAME_HINTS = (
     "embed_tokens",
     "lm_head",
     "codebook",
+    "token_codes",
     "markov_w1",
     "markov_w2",
 )

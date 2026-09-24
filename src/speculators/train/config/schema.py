@@ -507,6 +507,19 @@ class DFlash2Args(_Group):
     )
 
 
+class DFlashPrefixArgs(_Group):
+    """Candidate attention over the chosen DFlash prefix."""
+    prefix_rank: int = Field(default=64, ge=8)
+    prefix_top_k: int = Field(default=16, ge=2)
+    prefix_loss_alpha: float = Field(default=1.0, ge=0)
+    prefix_gate_init: float = Field(default=0.1, gt=0, lt=4)
+    prefix_freeze_backbone: bool = Field(default=False)
+    prefix_backbone_init: str | None = Field(default=None)
+    prefix_detach_backbone: bool = Field(default=False, json_schema_extra=_CLI_BOOL_OPTIONAL)
+    prefix_loss_kind: Literal["restricted_soft_ce", "target_ce"] = Field(default="restricted_soft_ce")
+    prefix_walk_backend: Literal["torch", "triton", "auto"] = Field(default="torch")
+
+
 class DSparkArgs(_Group):
     """DSpark-exclusive heads (sequential Markov head + confidence head)."""
 
@@ -570,6 +583,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
+    "dflash_prefix": DFlashPrefixArgs,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -680,6 +694,7 @@ class TrainConfig(BaseSettings):
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
+    dflash_prefix: DFlashPrefixArgs = Field(default_factory=DFlashPrefixArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -715,8 +730,8 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type == "dflash"
-        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
+        is_dflash = self.speculator_type in {"dflash", "dflash_prefix"}
+        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2", "dflash_prefix"}
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:

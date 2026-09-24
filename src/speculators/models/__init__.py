@@ -24,3 +24,5 @@ __all__ = [
     "PEagleDraftModel",
     "PEagleSpeculatorConfig",
 ]
+
+from .dflash_prefix import DFlashPrefixDraftModel, DFlashPrefixSpeculatorConfig
