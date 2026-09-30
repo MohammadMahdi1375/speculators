@@ -2,10 +2,14 @@
 # From speculators/: CHECK_ONLY=1 bash examples/train/train_dflash_prefix_tau.sh
 set -eo pipefail
 
+# Check the entire file before preparing a run or starting a process.
+bash -n -- "${BASH_SOURCE[0]}"
+
 # ============================================================
 # Paths -- helpers live inside Speculators, not the old ZIP folder.
 # ============================================================
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 export SPEC_MAIN="${SPEC_MAIN:-$(cd -- "$SCRIPT_DIR/../../.." && pwd)}"
 SPEC_MAIN="$(cd -- "$SPEC_MAIN" && pwd)"
 ENV_ROOT="${ENV_ROOT:-${CONDA_PREFIX:-}}"
@@ -28,14 +32,19 @@ echo "Using PYTHON_BIN=$PYTHON_BIN"
 HELPER_DIR="$SPEC_MAIN/speculators/scripts/dflash_prefix_tau"
 
 export MODEL="${MODEL:-/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
-export DATASET="${DATASET:-/home/n84449292/m84379596/Huggingface/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072}"
+export DATASET="${DATASET:-/home/n84449292/m84379596/Huggingface/datasets/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072}"
 # Only read the original recipe. No saved draft weights are loaded.
 export BASE_TRAIN_CONFIG="${BASE_TRAIN_CONFIG:-$SPEC_MAIN/output/dflash_qwen3_4b_openperfectblend_bs16/checkpoints/run.yaml}"
+if [[ ! -f "$BASE_TRAIN_CONFIG" || ! -r "$BASE_TRAIN_CONFIG" ]]; then
+    printf 'ERROR: Base training recipe is missing or unreadable: %s\n' "$BASE_TRAIN_CONFIG" >&2
+    printf 'Copy the original run.yaml, or set BASE_TRAIN_CONFIG to its actual path.\n' >&2
+    exit 1
+fi
 
 # ============================================================
 # Training settings -- edit these defaults or override via env.
 # ============================================================
-export BLOCK_SIZE="${BLOCK_SIZE:-16}"         # 1 anchor + 7 proposed tokens
+export BLOCK_SIZE="${BLOCK_SIZE:-16}"       # 1 anchor + 15 proposed tokens
 export PREFIX_TOP_K="${PREFIX_TOP_K:-16}"   # candidates per position, not block size
 export PREFIX_RANK="${PREFIX_RANK:-256}"
 export PREFIX_HEADS="${PREFIX_HEADS:-4}"
@@ -59,7 +68,7 @@ if [[ "$CHECK_ONLY" != 0 && "$CHECK_ONLY" != 1 ]]; then
     echo "CHECK_ONLY must be 0 or 1" >&2
     exit 2
 fi
-OUTPUT_ROOT="$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs16_layer2"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs${BLOCK_SIZE}_layer${PREFIX_LAYERS}}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT}"
 if [[ "${OUTPUT_DIR%/}" == "$OUTPUT_ROOT" ]]; then
     export OUTPUT_DIR="$OUTPUT_ROOT/tau_v2_scratch_$(date +%Y%m%d_%H%M%S)_$$"
@@ -79,9 +88,19 @@ export NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-5}"
 # Ascend environment
 # ============================================================
 unset PYTHONPATH ASCEND_LAUNCH_BLOCKING
-source "$CANN_ROOT/ascend-toolkit/set_env.sh"
-source "$CANN_ROOT/nnal/atb/set_env.sh"
-export SOC_VERSION=ascend910_9372
+CANN_ENV_SH="${CANN_ENV_SH:-$CANN_ROOT/ascend-toolkit/set_env.sh}"
+ATB_ENV_SH="${ATB_ENV_SH:-$CANN_ROOT/nnal/atb/set_env.sh}"
+for env_file in "$CANN_ENV_SH" "$ATB_ENV_SH"; do
+    if [[ ! -r "$env_file" ]]; then
+        printf 'ERROR: Ascend environment file is unreadable: %s\n' "$env_file" >&2
+        printf 'Set CANN_ROOT, or set CANN_ENV_SH and ATB_ENV_SH explicitly.\n' >&2
+        exit 1
+    fi
+done
+source "$CANN_ENV_SH"
+source "$ATB_ENV_SH"
+# Do not force the old server chip. An explicit SOC_VERSION, if needed,
+# must match this A2 server and its installed vllm-ascend build.
 export PYTHONPATH="$SPEC_MAIN/speculators/src:$SPEC_MAIN/speculators/hs_connectors/src:$SPEC_MAIN/vllm:$SPEC_MAIN/vllm-ascend:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="$ENV_ROOT/lib:${LD_LIBRARY_PATH:-}"
 if [[ -f "$ENV_ROOT/lib/libstdc++.so.6" ]]; then
@@ -97,7 +116,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 set -u
 
 # ============================================================
-# Prepare the block-8 scratch run and record its configuration.
+# Prepare a scratch run with BLOCK_SIZE tokens and record its configuration.
 # ============================================================
 for name in MODEL DATASET BASE_TRAIN_CONFIG OUTPUT_DIR; do
     resolved_path="$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON_BIN" -c \
@@ -115,7 +134,7 @@ SNAPSHOT_DIR="$OUTPUT_DIR/provenance/tau_training"
 mkdir -p "$SNAPSHOT_DIR"
 cp -- "$HELPER_DIR/prepare_experiment.py" "$HELPER_DIR/train_entry.py" \
     "$HELPER_DIR/check_selector.py" "$HELPER_DIR/checkpoint_config.py" "$SNAPSHOT_DIR/"
-cp -- "$SCRIPT_DIR/train_dflash_prefix_tau.sh" "$SNAPSHOT_DIR/"
+cp -- "$SCRIPT_PATH" "$SNAPSHOT_DIR/train_dflash_prefix_tau.sh"
 cp -- "$SPEC_MAIN/speculators/examples/serve_dflash_prefix_tau.sh" "$SNAPSHOT_DIR/"
 # Snapshot the installed model too: git diff alone omits untracked source files.
 cp -a -- "$SPEC_MAIN/speculators/src/speculators/models/dflash_prefix" \
@@ -200,4 +219,6 @@ else
 fi
 echo "Best checkpoint: $OUTPUT_DIR/checkpoints/checkpoint_best"
 echo "Tau history: $OUTPUT_DIR/checkpoints/tau_history.jsonl"
-echo "Serve: BLOCK_SIZE='$BLOCK_SIZE' DRAFT='$OUTPUT_DIR/checkpoints/checkpoint_best' bash '$SPEC_MAIN/speculators/examples/serve_dflash_prefix_tau.sh'"
+printf 'Serve: BLOCK_SIZE=%q DRAFT=%q bash %q\n' \
+    "$BLOCK_SIZE" "$OUTPUT_DIR/checkpoints/checkpoint_best" \
+    "$SPEC_MAIN/speculators/examples/serve_dflash_prefix_tau.sh"

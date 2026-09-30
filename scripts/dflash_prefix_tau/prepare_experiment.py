@@ -18,7 +18,11 @@ def write_config(base_path, output, *, model, dataset, port=8092, epochs=5,
     base_path, output = Path(base_path).resolve(), Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Use a fresh OUTPUT_DIR: {output}")
-    base = TrainConfig.resolve(["--config", str(base_path)]).flatten()
+    base = TrainConfig.resolve([
+        "--config", str(base_path),
+        "--verifier-name-or-path", str(Path(model).resolve()),
+        "--data-path", str(Path(dataset).resolve()),
+    ]).flatten()
     if base["hidden_states_backend"] != "file":
         raise ValueError("Expected the existing file-backed hidden-state setup")
     if base["from_pretrained"] or base["draft_config"]:
