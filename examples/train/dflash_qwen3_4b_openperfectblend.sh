@@ -78,7 +78,7 @@ MODEL="/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1c
 DATASET="/home/n84449292/m84379596/Huggingface/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072/"
 
 # Use a separate output directory from DSpark.
-OUTPUT_DIR="/home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main/output/dflash_qwen3_4b_openperfectblend_bs16"
+OUTPUT_DIR="/home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main/output/dflash_qwen3_4b_openperfectblend_bs16_2"
 
 # ============================================================================
 # vLLM hidden-state server
@@ -133,10 +133,10 @@ MASK_TOKEN_ID=151669
 # NPU assignments
 # ============================================================================
 
-VLLM_NPUS="0,1"
+VLLM_NPUS="8,9"
 VLLM_DP=2
 
-TRAIN_NPUS="2,3,4,5,6,7"
+TRAIN_NPUS="10,11,12,13,14,15"
 NUM_TRAIN_NPUS=6
 
 # ============================================================================
