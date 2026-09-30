@@ -25,7 +25,7 @@ export BLOCK_SIZE="${BLOCK_SIZE:-16}"         # 1 anchor + 7 proposed tokens
 export PREFIX_TOP_K="${PREFIX_TOP_K:-16}"   # candidates per position, not block size
 export PREFIX_RANK="${PREFIX_RANK:-256}"
 export PREFIX_HEADS="${PREFIX_HEADS:-4}"
-export PREFIX_LAYERS="${PREFIX_LAYERS:-1}"
+export PREFIX_LAYERS="${PREFIX_LAYERS:-2}"
 export EPOCHS="${EPOCHS:-5}"
 export SELECTOR_DELAY_STEPS="${SELECTOR_DELAY_STEPS:-2000}"
 export SELECTOR_WARMUP_STEPS="${SELECTOR_WARMUP_STEPS:-2000}"
@@ -45,7 +45,7 @@ if [[ "$CHECK_ONLY" != 0 && "$CHECK_ONLY" != 1 ]]; then
     echo "CHECK_ONLY must be 0 or 1" >&2
     exit 2
 fi
-OUTPUT_ROOT="$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs${BLOCK_SIZE}_layer1"
+OUTPUT_ROOT="$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs16_layer2"
 export OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT}"
 if [[ "${OUTPUT_DIR%/}" == "$OUTPUT_ROOT" ]]; then
     export OUTPUT_DIR="$OUTPUT_ROOT/tau_v2_scratch_$(date +%Y%m%d_%H%M%S)_$$"
@@ -58,8 +58,8 @@ export VLLM_NPUS="${VLLM_NPUS:-0,1}"
 export VLLM_DP="${VLLM_DP:-2}"
 export VLLM_PORT="${VLLM_PORT:-8092}"
 export VLLM_RPC_PORT="${VLLM_RPC_PORT:-29692}"
-export TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
-export NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-6}"
+export TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6}"
+export NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-5}"
 
 # ============================================================
 # Ascend environment
