@@ -8,9 +8,23 @@ set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export SPEC_MAIN="${SPEC_MAIN:-$(cd -- "$SCRIPT_DIR/../../.." && pwd)}"
 SPEC_MAIN="$(cd -- "$SPEC_MAIN" && pwd)"
-ENV_ROOT="${ENV_ROOT:-/home/n84449292/m84379596/conda/vllm-dflash2-main}"
+ENV_ROOT="${ENV_ROOT:-${CONDA_PREFIX:-}}"
+
+if [[ -z "$ENV_ROOT" ]]; then
+    echo "ERROR: No Conda environment is active and ENV_ROOT was not provided." >&2
+    exit 1
+fi
+
 CANN_ROOT="${CANN_ROOT:-/home/n84449292/m84379596/CANN/9.1.0}"
 PYTHON_BIN="${PYTHON_BIN:-$ENV_ROOT/bin/python}"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: Python not found: $PYTHON_BIN" >&2
+    exit 1
+fi
+
+echo "Using ENV_ROOT=$ENV_ROOT"
+echo "Using PYTHON_BIN=$PYTHON_BIN"
 HELPER_DIR="$SPEC_MAIN/speculators/scripts/dflash_prefix_tau"
 
 export MODEL="${MODEL:-/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
