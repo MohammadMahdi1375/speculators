@@ -39,6 +39,7 @@ def run_phase(args, phase, output, helper, reference=None):
     env = dict(os.environ, SPEC_MAIN=str(args.spec_main), DRAFT_MODEL=str(args.draft),
                TARGET_MODEL=str(args.target), NPU=args.npu, PORT=str(args.port),
                TARGET_EXECUTION=phase, MODE="fast", GRAPH_METRICS="1", CHECK_ONLY="0",
+               COMPARISON_PROFILE="custom", HEAD_EXECUTION="auto",
                PYTHON_BIN=sys.executable, RUN_DIR=str(run_dir),
                SERVED_MODEL_NAME=args.served_model_name,
                SPECULATIVE_METHOD=args.speculative_method,

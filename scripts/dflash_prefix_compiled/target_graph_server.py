@@ -136,6 +136,7 @@ def serving_environment(inherited, kind, mode):
     if mode not in {"reference", "validate", "fast"}:
         raise ValueError("MODE must be reference, validate, or fast")
     env = {k: v for k, v in inherited.items() if not k.startswith("DFLASH_PREFIX_")}
+    env["VLLM_ASCEND_DSPARK_HEAD_GRAPH"] = "off"
     for key in ("TORCH_COMPILE_DISABLE", "TORCHDYNAMO_DISABLE", "ASCEND_LAUNCH_BLOCKING"):
         env.pop(key, None)
     # Profiling and validation settings from previous terminals must not leak.
@@ -159,6 +160,23 @@ def serving_environment(inherited, kind, mode):
 
 def command_and_record(args):
     root = args.spec_main.expanduser().resolve(strict=True)
+    profile = getattr(args, "comparison_profile", "custom")
+    head_execution = getattr(args, "head_execution", "auto")
+    if profile not in {"matched_fast", "matched_reference", "backend_default", "custom"}:
+        raise ValueError("Unknown comparison profile")
+    if profile in {"matched_fast", "matched_reference"}:
+        if getattr(args, "draft_enforce_eager", "omit") != "1":
+            raise ValueError("Matched profiles require DRAFT_ENFORCE_EAGER=1 for ALL draft backbones")
+        if profile == "matched_reference" and head_execution not in {"auto", "reference"}:
+            raise ValueError("matched_reference requires HEAD_EXECUTION=reference")
+        if profile == "matched_fast" and head_execution not in {"auto", "fast", "validate"}:
+            raise ValueError("matched_fast requires HEAD_EXECUTION=fast or validate")
+    if profile == "backend_default" and getattr(args, "draft_enforce_eager", "omit") != "omit":
+        raise ValueError("backend_default requires DRAFT_ENFORCE_EAGER=omit")
+    if head_execution == "auto":
+        head_execution = ("reference" if profile == "matched_reference" else args.mode)
+    if head_execution not in {"fast", "validate", "reference"}:
+        raise ValueError("HEAD_EXECUTION must be fast, validate or reference")
     draft, target, kind, block, spec = checkpoint(
         args.draft, args.target, getattr(args, "speculative_method", "auto"),
         getattr(args, "num_speculative_tokens", "auto"),
@@ -220,10 +238,25 @@ def command_and_record(args):
         command.append("--enforce-eager")
     if args.graph_metrics:
         command.append("--cudagraph-metrics")
-    env = serving_environment(os.environ, kind, args.mode)
+    env = serving_environment(os.environ, kind, head_execution)
+    if kind == "dspark" and profile != "custom":
+        env["VLLM_ASCEND_DSPARK_HEAD_GRAPH"] = "off" if head_execution == "reference" else head_execution
+        config = json.loads((draft / "config.json").read_text())
+        if config.get("draft_vocab_size") not in (None, config["transformer_layer_config"]["vocab_size"]):
+            raise ValueError("Matched DSpark head graph supports full-vocabulary checkpoints only")
+    dspark_graph = env["VLLM_ASCEND_DSPARK_HEAD_GRAPH"]
+    if dspark_graph != "off":
+        graph_source = "vllm-ascend/vllm_ascend/spec_decode/dspark_head_graph.py"
+        sources[graph_source] = digest(root / graph_source)
+        if "_dspark_head_runtime" not in base:
+            raise ValueError("DSpark head graph hook is not installed")
     env["ASCEND_RT_VISIBLE_DEVICES"] = args.npu
     record = {
         "target": str(target), "draft": str(draft), "kind": kind,
+        "comparison_profile": profile,
+        "head_execution_requested": ("argmax" if kind == "dflash" else head_execution),
+        "dspark_head_graph": dspark_graph,
+        "dspark_validate_steps": 32 if dspark_graph != "off" else 0,
         "target_config_sha256": digest(target / "config.json"),
         "draft_config_sha256": digest(draft / "config.json"), "source_sha256": sources,
         "block_size": block, "proposals": proposals, "verification_tokens": verification_tokens,
@@ -232,7 +265,7 @@ def command_and_record(args):
         "draft_enforce_eager": spec.get("enforce_eager"),
         "draft_execution_requested": ("backend_default" if "enforce_eager" not in spec
                                       else "eager" if spec["enforce_eager"] else "graph_allowed"),
-        "draft_backend_note": ("AscendDSparkProposer currently disables its own draft graph."
+        "draft_backend_note": ("DSpark draft attention stays eager; a separate Markov-loop graph is explicitly recorded."
                                if kind == "dspark" else "Runtime dispatch must be checked in the server log."),
         "npu": args.npu, "port": args.port, "served_model_name": args.served_model_name,
         "command": command, "compilation_config": compilation, "speculative_config": spec,
@@ -262,7 +295,7 @@ def add_evaluator_record(record, args, log):
         prefix_token_cache=False, prefix_validate_steps=32 if prefix and mode != "reference" else 0,
         num_speculative_tokens=record["proposals"], server_log=str(log),
         launcher_pid=int(process_stat.split(" ", 1)[0]), launcher_start_ticks=fields[19],
-        suggested_method=f"{record['kind']}_bs{record['block_size']}_k{record['proposals']}_{args.target_execution}_{mode}",
+        suggested_method=f"{record['kind']}_bs{record['block_size']}_k{record['proposals']}_{args.target_execution}_{record['head_execution_requested']}",
         device=f"npu:{args.npu}", tp_size=1, dp_size=1, dtype="bfloat16",
         max_num_seqs=1, prefix_caching=False,
         enforce_eager=args.target_execution == "eager", model_runner="ascend_v1",
@@ -283,6 +316,8 @@ def main():
     parser.add_argument("--num-speculative-tokens", default=os.environ.get("NUM_SPECULATIVE_TOKENS", "auto"))
     parser.add_argument("--draft-enforce-eager", choices=("omit", "1", "0"),
                         default=os.environ.get("DRAFT_ENFORCE_EAGER", "omit"))
+    parser.add_argument("--comparison-profile", choices=("matched_fast", "matched_reference", "backend_default", "custom"), default="custom")
+    parser.add_argument("--head-execution", choices=("auto", "reference", "validate", "fast"), default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--kv-block-size", type=int, default=128)
     parser.add_argument("--register-evaluator", type=int, choices=(0, 1), default=0,
@@ -297,6 +332,7 @@ def main():
     root, command, env, record = command_and_record(args)
     if not args.check_only:
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind(("127.0.0.1", args.port))
             except OSError as error:
@@ -326,6 +362,8 @@ def main():
           "full_verification=True", flush=True)
     print(f"Target: {record['target']}\nDraft: {record['draft']}", flush=True)
     print(f"Draft backend: {record['draft_backend_note']}", flush=True)
+    print(f"COMPARISON_REQUEST profile={record['comparison_profile']} target={args.target_execution} "
+          f"draft={record['draft_execution_requested']} head={record['head_execution_requested']}", flush=True)
     print(f"Launch record: {output / 'launch.json'}", flush=True)
     if args.register_evaluator:
         print(f"Server log: {log}", flush=True)
