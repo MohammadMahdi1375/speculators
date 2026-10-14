@@ -35,12 +35,15 @@ def run_phase(args, phase, output, helper, reference=None):
     log_path = output / f"{phase}.log"
     run_dir = output / phase
     probe_path = output / f"{phase}_probe.json"
-    command = ["bash", str(args.spec_main / "speculators/examples/serve_dflash_target_graph.sh")]
-    env = dict(os.environ, SPEC_MAIN=str(args.spec_main), DRAFT=str(args.draft),
+    command = ["bash", str(args.spec_main / "Evaluator/run_server_dflash.sh")]
+    env = dict(os.environ, SPEC_MAIN=str(args.spec_main), DRAFT_MODEL=str(args.draft),
                TARGET_MODEL=str(args.target), NPU=args.npu, PORT=str(args.port),
                TARGET_EXECUTION=phase, MODE="fast", GRAPH_METRICS="1", CHECK_ONLY="0",
                PYTHON_BIN=sys.executable, RUN_DIR=str(run_dir),
-               SERVED_MODEL_NAME="qwen3-4b-dflash")
+               SERVED_MODEL_NAME=args.served_model_name,
+               SPECULATIVE_METHOD=args.speculative_method,
+               NUM_SPECULATIVE_TOKENS=args.num_speculative_tokens,
+               DRAFT_ENFORCE_EAGER=args.draft_enforce_eager)
     opener = helper.urllib.request.build_opener(helper.urllib.request.ProxyHandler({}))
     process = None
     try:
@@ -56,7 +59,7 @@ def run_phase(args, phase, output, helper, reference=None):
                 except (urllib.error.URLError, TimeoutError, RuntimeError):
                     models = None
                 if models is not None:
-                    if "qwen3-4b-dflash" not in [r["id"] for r in models["data"]]:
+                    if args.served_model_name not in [r["id"] for r in models["data"]]:
                         raise RuntimeError("Unexpected model on the requested port")
                     break
                 now = time.monotonic()
@@ -91,13 +94,13 @@ def run_phase(args, phase, output, helper, reference=None):
             deadline = time.monotonic() + 15
             while True:
                 text = log_path.read_text(errors="replace")
-                graph_ok = phase == "eager" or full_dispatch_observed(text, launch["block_size"])
+                graph_ok = phase == "eager" or full_dispatch_observed(text, launch["proposals"] + 1)
                 if graph_ok or time.monotonic() >= deadline:
                     break
                 time.sleep(1)
             if not graph_ok:
                 raise RuntimeError(f"No FULL target decode dispatch observed; see {log_path}. Do not assume the requested graph ran.")
-            if launch["kind"] != "dflash" and not any(
+            if launch["kind"] in {"local_prefix_v2", "compiled_prefix_v3"} and not any(
                 "PREFIX_PARITY_PASS" in line and "steady-state fast path enabled" in line
                 for line in text.splitlines()
             ):
@@ -119,6 +122,10 @@ def main():
     parser.add_argument("--port", type=int, default=8213)
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=512)
+    parser.add_argument("--speculative-method", choices=("auto", "dflash", "dspark"), default="auto")
+    parser.add_argument("--num-speculative-tokens", default="auto")
+    parser.add_argument("--draft-enforce-eager", choices=("omit", "1", "0"), default="omit")
+    parser.add_argument("--served-model-name", default="qwen3-4b-spec-check")
     args = parser.parse_args()
     args.spec_main = args.spec_main.expanduser().resolve(strict=True)
     args.draft = args.draft.expanduser().resolve(strict=True)
@@ -137,7 +144,10 @@ def main():
     helper = helpers()
     output.mkdir(parents=True, exist_ok=False)
     record = {"complete": False, "diagnostic_only": True, "draft": str(args.draft),
-              "npu": args.npu, "port": args.port, "num_prompts": args.num_prompts, "tokens": args.tokens}
+              "npu": args.npu, "port": args.port, "num_prompts": args.num_prompts, "tokens": args.tokens,
+              "speculative_method_requested": args.speculative_method,
+              "num_speculative_tokens_requested": args.num_speculative_tokens,
+              "draft_enforce_eager_requested": args.draft_enforce_eager}
     print(f"Output check: {output}\nTwo servers run sequentially on NPU {args.npu}; no benchmark.", flush=True)
     try:
         eager = run_phase(args, "eager", output, helper)
@@ -157,7 +167,9 @@ def main():
             record["collection_error"] = f"{type(error).__name__}: {error}"
         (output / "result.json").write_text(json.dumps(record, indent=2) + "\n")
     if record["complete"]:
-        print("TARGET_GRAPH_CHECK_PASS: observed token IDs and acceptance counters match; target FULL dispatch and selector fast path confirmed. Ready for the full benchmark.")
+        print("TARGET_GRAPH_CHECK_PASS: observed token IDs and acceptance counters match; "
+              "target FULL dispatch confirmed; prefix selector checks applied only to prefix checkpoints. "
+              "This covers the observed prompts, not universal parity or speedup.")
     print(f"Small result file: {output / 'result.json'}")
     return 0 if record["complete"] else 1
 
