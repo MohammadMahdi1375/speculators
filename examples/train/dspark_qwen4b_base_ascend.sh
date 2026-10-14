@@ -139,8 +139,8 @@ MASK_TOKEN_ID=151669
 
 MARKOV_RANK=256
 
-# MARKOV_HEAD_TYPE="vanilla"
-MARKOV_HEAD_TYPE="rnn"
+MARKOV_HEAD_TYPE="vanilla"
+# MARKOV_HEAD_TYPE="rnn"
 
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 
