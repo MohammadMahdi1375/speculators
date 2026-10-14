@@ -48,7 +48,7 @@ export BLOCK_SIZE="${BLOCK_SIZE:-16}"       # 1 anchor + 15 proposed tokens
 export PREFIX_TOP_K="${PREFIX_TOP_K:-16}"   # candidates per position, not block size
 export PREFIX_RANK="${PREFIX_RANK:-256}"
 export PREFIX_HEADS="${PREFIX_HEADS:-4}"
-export PREFIX_LAYERS="${PREFIX_LAYERS:-2}"
+export PREFIX_LAYERS="${PREFIX_LAYERS:-1}"
 export EPOCHS="${EPOCHS:-5}"
 export SELECTOR_DELAY_STEPS="${SELECTOR_DELAY_STEPS:-2000}"
 export SELECTOR_WARMUP_STEPS="${SELECTOR_WARMUP_STEPS:-2000}"
@@ -68,7 +68,7 @@ if [[ "$CHECK_ONLY" != 0 && "$CHECK_ONLY" != 1 ]]; then
     echo "CHECK_ONLY must be 0 or 1" >&2
     exit 2
 fi
-OUTPUT_ROOT="${OUTPUT_ROOT:-$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs${BLOCK_SIZE}_layer${PREFIX_LAYERS}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$SPEC_MAIN/output/dflash_prefix_qwen3_4b_openperfectblend_bs16_layer1}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT}"
 if [[ "${OUTPUT_DIR%/}" == "$OUTPUT_ROOT" ]]; then
     export OUTPUT_DIR="$OUTPUT_ROOT/tau_v2_scratch_$(date +%Y%m%d_%H%M%S)_$$"

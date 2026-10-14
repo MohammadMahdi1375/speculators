@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Joint draft/prefix-head pilot; windows are not full dataset epochs."""
+import json
+import math
+import os
+from itertools import islice
+from pathlib import Path
+
+
+class FixedSampler:
+    def set_epoch(self, epoch):
+        pass
+
+
+class WindowLoader:
+    """Continue one data iterator across evaluation windows, without replaying skips."""
+    def __init__(self, loader, steps, window):
+        self.loader, self.steps, self.window = loader, steps, window
+        self.completed, self.data_epoch, self.iterator = 0, 0, None
+        self.batch_sampler = FixedSampler()
+
+    def __len__(self):
+        return min(self.window, max(0, self.steps - self.completed))
+
+    def __iter__(self):
+        count = len(self)
+        for _ in range(count):
+            if self.iterator is None:
+                if hasattr(self.loader.batch_sampler, "set_epoch"):
+                    self.loader.batch_sampler.set_epoch(self.data_epoch)
+                self.iterator = iter(self.loader)
+            try:
+                item = next(self.iterator)
+            except StopIteration:
+                self.data_epoch += 1
+                if hasattr(self.loader.batch_sampler, "set_epoch"):
+                    self.loader.batch_sampler.set_epoch(self.data_epoch)
+                self.iterator = iter(self.loader)
+                item = next(self.iterator)
+            self.completed += 1
+            yield item
+
+
+def install_hooks(cli, trainer_module, settings):
+    import torch
+    from speculators.models.dflash_prefix.boundary_training import build_boundary_model
+    from speculators.models.dflash_prefix.boundary_validation import CachedValidationLoader, exported_precision
+    Trainer = trainer_module.Trainer
+    old_loaders, old_val = cli.create_train_val_loaders, Trainer.val_epoch
+    old_run = Trainer.run_training
+
+    def build(args, model_class, t2d, d2t, draft_vocab_size):
+        if not args.no_resume_from_checkpoint or args.fsdp_shard:
+            raise ValueError("Pilot requires no resume and no FSDP")
+        model = build_boundary_model(settings["init_checkpoint"], settings["target_path"], settings)
+        if model.config.block_size != args.block_size:
+            raise ValueError("Pilot model/training block size mismatch")
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.float()
+        return model
+
+    def loaders(**kwargs):
+        train, val = old_loaders(**kwargs)
+        if len(train) < 1 or val is None or len(val) < 1:
+            raise ValueError("Pilot requires nonempty train and validation splits")
+        return WindowLoader(train, settings["pilot_steps"], settings["eval_every"]), CachedValidationLoader(val, settings["val_batches"],
+            Path(settings["output_dir"]) / "validation_inputs" / f"rank_{os.environ.get('RANK', '0')}")
+
+    def validate(self, epoch):
+        devices = [] if self.device_type == "cpu" else [torch.get_device_module(self.device_type).current_device()]
+        with torch.random.fork_rng(devices=devices, device_type=self.device_type), exported_precision(self.model):
+            torch.random.default_generator.manual_seed(4242)
+            if self.device_type != "cpu":
+                torch.get_device_module(self.device_type).manual_seed(4242)
+            metrics = old_val(self, epoch)
+        if self.rank == 0:
+            record = {"window": epoch, "step": self.global_step, "metrics": metrics,
+                      "note": "Fixed cached target inputs, deterministic anchors and BF16 weights; reference proxy, not serving tau"}
+            with (Path(self.checkpointer.path) / "boundary_history.jsonl").open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+            if epoch >= 0:
+                link = Path(self.checkpointer.path) / f"step_{self.global_step}"
+                if link.exists() and not link.is_symlink():
+                    raise ValueError(f"Refusing to overwrite ordinary path: {link}")
+                link.unlink(missing_ok=True)
+                link.symlink_to(str(epoch), target_is_directory=True)
+        return metrics
+
+    def run(self):
+        # Same fixed validation anchors/RNG as later windows, before any update.
+        # The initial checkpoint remains INIT_CHECKPOINT; no fake step_0 link.
+        initial = self.val_epoch(-1)
+        if settings["objective"] != "control":
+            scores = initial or {}
+            selector_active = settings["boundary_weight"] > 0
+            support_active = settings["objective"] == "dual_boundary" and settings.get("support_weight", 0.) > 0
+            value = scores.get("refresh_teachable_frontier_fraction_epoch", 0.) if selector_active else 0.
+            support_value = scores.get("support_teachable_miss_fraction_epoch", 0.) if support_active else 0.
+            if (selector_active or support_active) and max(value, support_value) <= 0:
+                raise ValueError(
+                    "No target-checked refreshed teacher can teach a covered first error "
+                    "or eligible missing candidate in initial validation. Pilot stopped before optimization; inspect "
+                    "boundary_history.jsonl instead of spending 2000 steps on no signal.")
+        return old_run(self)
+
+    def optimizers(model, config):
+        unwrapped = model.module if hasattr(model, "module") else model
+        head, backbone = [], []
+        for name, parameter in unwrapped.named_parameters():
+            if parameter.requires_grad:
+                (head if name.startswith("prefix_head.") else backbone).append(parameter)
+        if not head or not backbone:
+            raise ValueError("Both existing prefix head and draft layer must be trainable")
+        return [torch.optim.AdamW([
+            {"params": head, "lr": settings["head_lr"], "name": "prefix_head"},
+            {"params": backbone, "lr": settings["backbone_lr"], "name": "draft_backbone"},
+        ], weight_decay=0.0)]
+
+    trainer_module.build_optimizers = optimizers
+    cli.build_draft_model, cli.create_train_val_loaders = build, loaders
+    Trainer.val_epoch = validate
+    Trainer.run_training = run
+    # Keep every numbered checkpoint. A proxy loss is not a serving speed metric.
+    Trainer.maybe_update_best = lambda self, epoch, metrics: None
+
+
+def main():
+    import torch
+    import torch_npu  # noqa: F401
+    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    import speculators.train.cli as cli
+    import speculators.train.trainer as trainer_module
+    from speculators.train.config import TrainConfig
+    config = TrainConfig.resolve()
+    flat = config.flatten()
+    settings = json.loads((Path(flat["save_path"]).resolve().parent / "settings.json").read_text())
+    if flat["epochs"] != math.ceil(settings["pilot_steps"] / settings["eval_every"]) or flat["max_steps"] is not None:
+        raise ValueError("Use the prepared bounded evaluation-window config")
+    install_hooks(cli, trainer_module, settings)
+    cli.main(config)
+
+
+if __name__ == "__main__":
+    main()

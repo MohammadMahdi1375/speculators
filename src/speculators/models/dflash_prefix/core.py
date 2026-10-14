@@ -50,6 +50,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
                 heads=config.prefix_attention_heads,
                 layers=config.prefix_attention_layers,
                 history_scale=config.prefix_history_scale,
+                compiled_logit_cap=config.prefix_compiled_logit_cap,
             )
         self._apply_backbone_freeze()
 
@@ -58,7 +59,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
             for name, parameter in self.named_parameters():
                 parameter.requires_grad_(name.startswith("prefix_head."))
         if (hasattr(self, "prefix_head")
-                and self.config.prefix_selector_kind == "local_prefix_v2"):
+                and self.config.prefix_selector_kind in {"local_prefix_v2", "compiled_prefix_v3"}):
             self.prefix_head.set_history_trainable(self.config.prefix_history_scale > 0)
 
     def _prefix_kwargs(self):
@@ -86,6 +87,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
             prefix_loss_kind=kwargs.get("prefix_loss_kind", "restricted_soft_ce"),
             prefix_walk_backend=kwargs.get("prefix_walk_backend", "torch"),
             prefix_selector_kind=kwargs.get("prefix_selector_kind", "legacy"),
+            prefix_compiled_logit_cap=kwargs.get("prefix_compiled_logit_cap", 8.0),
             prefix_attention_heads=kwargs.get("prefix_attention_heads", 4),
             prefix_attention_layers=kwargs.get("prefix_attention_layers", 2),
             prefix_history_scale=kwargs.get("prefix_history_scale", 1.0),
@@ -227,7 +229,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
         if self.config.prefix_detach_backbone:
             hidden = hidden.detach()
             unary = unary.detach()
-        if self.config.prefix_selector_kind == "local_prefix_v2":
+        if self.config.prefix_selector_kind in {"local_prefix_v2", "compiled_prefix_v3"}:
             candidate_logits, candidates = unary_topk(unary, self.config.prefix_top_k)
         else:
             candidate_logits, candidates = unary.topk(self.config.prefix_top_k, dim=-1)
@@ -338,7 +340,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
                         elif scale == 1:
                             selected = chosen[start:stop]
                         else:
-                            if self.config.prefix_selector_kind == "local_prefix_v2":
+                            if self.config.prefix_selector_kind in {"local_prefix_v2", "compiled_prefix_v3"}:
                                 selected = self.prefix_head.greedy_walk_scaled(table, scale)
                             else:
                                 selected = self.prefix_head.greedy_walk(
@@ -363,7 +365,7 @@ class DFlashPrefixDraftModel(DFlashDraftModel):
                 )
                 oracle_prefix = (reference_covered & valid).long().cumprod(-1)
                 valid_blocks = valid[:, 0]
-                if (self.config.prefix_selector_kind == "local_prefix_v2"
+                if (self.config.prefix_selector_kind in {"local_prefix_v2", "compiled_prefix_v3"}
                         and self.prefix_head.history_scale > 0):
                     saved_scale = self.prefix_head.history_scale
                     try:

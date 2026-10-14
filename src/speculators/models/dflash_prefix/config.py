@@ -25,7 +25,8 @@ class DFlashPrefixSpeculatorConfig(DFlashSpeculatorConfig):
     prefix_detach_backbone: bool = False
     prefix_loss_kind: Literal["restricted_soft_ce", "target_ce"] = "restricted_soft_ce"
     prefix_walk_backend: Literal["torch", "triton", "auto"] = "torch"
-    prefix_selector_kind: Literal["legacy", "local_prefix_v2"] = "legacy"
+    prefix_selector_kind: Literal["legacy", "local_prefix_v2", "compiled_prefix_v3"] = "legacy"
+    prefix_compiled_logit_cap: float = Field(default=8.0, gt=0, le=8, allow_inf_nan=False)
     prefix_attention_heads: int = Field(default=4, ge=1)
     prefix_attention_layers: int = Field(default=2, ge=1)
     prefix_history_scale: float = Field(default=1.0, ge=0, le=1, allow_inf_nan=False)
@@ -50,11 +51,11 @@ class DFlashPrefixSpeculatorConfig(DFlashSpeculatorConfig):
             raise ValueError("dflash_prefix requires the full target vocabulary")
         if self.prefix_top_k > vocab:
             raise ValueError("prefix_top_k exceeds vocabulary size")
-        if self.prefix_selector_kind == "local_prefix_v2":
+        if self.prefix_selector_kind in {"local_prefix_v2", "compiled_prefix_v3"}:
             if self.prefix_rank % self.prefix_attention_heads:
                 raise ValueError("prefix_rank must be divisible by attention heads")
             if self.prefix_walk_backend != "torch":
-                raise ValueError("local_prefix_v2 currently requires the torch walk")
+                raise ValueError(f"{self.prefix_selector_kind} currently requires the torch walk")
         if (self.prefix_loss_scope == "reachable_greedy_prefix"
                 and self.prefix_loss_kind != "target_ce"):
             raise ValueError("reachable_greedy_prefix requires target_ce")

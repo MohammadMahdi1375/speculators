@@ -255,11 +255,16 @@ class LocalPrefixSelector(nn.Module):
 
 def make_prefix_head(vocab_size, hidden_size, rank, top_k, max_proposals,
                      gate_init=0.1, correction_scale=1.0, kind="legacy",
-                     heads=4, layers=2, history_scale=1.0):
+                     heads=4, layers=2, history_scale=1.0, compiled_logit_cap=8.0):
     if kind == "legacy":
         from .model_definitions import PrefixAttentionSelector
         return PrefixAttentionSelector(vocab_size, hidden_size, rank, top_k,
                                        max_proposals, gate_init, correction_scale)
+    if kind == "compiled_prefix_v3":
+        from .compiled_selector import CompiledPrefixSelector
+        return CompiledPrefixSelector(vocab_size, hidden_size, rank, top_k,
+                                      max_proposals, heads, correction_scale,
+                                      history_scale, compiled_logit_cap)
     if kind != "local_prefix_v2":
         raise ValueError(f"Unknown prefix selector kind: {kind}")
     return LocalPrefixSelector(vocab_size, hidden_size, rank, top_k, max_proposals,
