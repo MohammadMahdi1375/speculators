@@ -162,6 +162,7 @@ def test_reused_guard_workspaces_match_fresh_copies_across_updates(tmp_path):
     cached = fast.selector_guard
     cached.reuse_workspaces = True
     opts = [torch.optim.AdamW(m.prefix_head.parameters(), lr=1e-4) for m in (model, fast)]
+    previous = None
     for step in range(3):
         torch.manual_seed(120 + step)
         for a, b in zip(model.prefix_head.parameters(), fast.prefix_head.parameters()):

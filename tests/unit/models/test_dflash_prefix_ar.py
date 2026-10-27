@@ -276,7 +276,7 @@ def test_joint_ar_stops_at_document_and_loss_boundaries(tmp_path, monkeypatch):
     original = joint_training.causal_ar_loss
     captured = []
 
-    def capture(model, hidden, ids, docs, indices, valid, positions):  # noqa: PLR0917
+    def capture(model, hidden, ids, docs, indices, valid, positions):
         captured.append((indices.reshape(-1, 8), valid))
         return original(model, hidden, ids, docs, indices, valid, positions)
 

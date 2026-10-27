@@ -57,7 +57,7 @@ def create_ar_block_mask_mod(
     return mask, q_len, kv_len
 
 
-def ar_backbone_hidden(  # noqa: PLR0917
+def ar_backbone_hidden(
     model, hidden_states, input_ids, document_ids, block_indices, position_ids=None
 ):
     """Return next-token predictor states [1, anchors*(B-1), H].
@@ -123,7 +123,7 @@ def ddp_token_mean(local_sum, local_count):
     return local_sum * world / count.clamp_min(1)
 
 
-def causal_ar_loss(  # noqa: PLR0917
+def causal_ar_loss(
     model, hidden_states, input_ids, document_ids, indices, valid, position_ids=None
 ):
     """Standard CE on reference next tokens, pooled over valid tokens/ranks.
