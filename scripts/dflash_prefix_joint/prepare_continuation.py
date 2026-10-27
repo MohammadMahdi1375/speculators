@@ -94,7 +94,7 @@ def source_world(source, rank_dirs):
 
 
 def prepare(env):
-    from prepare_experiment import allocation
+    from prepare_experiment import allocation, execution_settings
     allocation(env)
     if not env.get("RESUME_CHECKPOINT"):
         raise ValueError("Use --resume-training CHECKPOINT; no checkpoint is chosen automatically")
@@ -196,6 +196,9 @@ def prepare(env):
         run_name=f"joint_continue_epoch{completed + 1}_to_{total_epochs}",
         log_dir=str(output / "logs/tensorboard"))
     new_settings.update(output_dir=str(output), epochs=total_epochs)
+    execution = execution_settings(env, prefix="RESUME_", inherited=settings)
+    new_settings.update(execution)
+    new_flat["gradient_checkpointing"] = execution["backbone_checkpointing"]
     if selected_policy == "restart":
         new_flat.update(scheduler_type="cosine", scheduler_total_steps=remaining * steps_per_epoch,
             scheduler_warmup_steps=int(remaining * steps_per_epoch * warmup_ratio), scheduler_warmup_ratio=None)
@@ -217,6 +220,8 @@ def prepare(env):
         limitations=["Source exports round weights and floating optimizer state to BF16",
                      "Source per-rank RNG and guard replay were not saved; replay is repopulated",
                      "Resume is not bit-exact to uninterrupted training"])
+    record["execution_overrides"] = {key: dict(before=settings.get(key), after=value)
+                                     for key, value in execution.items() if settings.get(key) != value}
     # Store source metadata; confirm the installed training model matches the saved architecture at startup.
     record["source_metadata_sha256"] = {name: digest(source / name) for name in
         ("train_config.yaml", "joint_settings.json", "resolved_schedule.json")}
@@ -282,7 +287,9 @@ def prepare(env):
         print(f"New cosine peak LRs: {record['peak_lrs']}; warmup ratio={warmup_ratio}")
     else:
         print("Restore saved schedulers, LR values, selector delay and original LR horizon")
-    print("Source model/data/batch/recomputation/guard settings retained. Source checkpoint is unchanged.")
+    print("Source model/data/batch/guard objective retained. Source checkpoint is unchanged.")
+    print("Resolved execution settings: " + json.dumps(execution, sort_keys=True))
+    print(f"AR settings inherited from source: weight={new_settings.get('ar_loss_weight', 0)}; pretrain steps={new_settings.get('ar_pretrain_steps', 0)}. AR_* environment overrides do not change a resumed objective.")
     print("Old BF16 exports do not contain original FP32 precision, RNG or guard replay; resume is not bit-exact.")
     return path
 

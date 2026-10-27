@@ -62,11 +62,13 @@ def cpu_and_hooks(monkeypatch):
     return cli, tm
 
 
-def create_source(directory, optimizer, monkeypatch, capture_mid=False):
+def create_source(directory, optimizer, monkeypatch, capture_mid=False, ar_weight=0.):
     directory.mkdir()
     s = dict(settings(), output_dir=str(directory), epochs=5, selector_kind="compiled_prefix_v3",
              backbone_checkpointing=False, selector_checkpointing=False, memory_log_every=0,
              packed_tokens_per_rank=32)
+    if ar_weight:
+        s.update(ar_loss_weight=ar_weight, ar_pretrain_steps=1, delay_steps=1)
     fixture, batch = helper("check_training").make_fixture(directory, s)
     del fixture
     data = directory / "dataset"
@@ -123,17 +125,20 @@ def assert_saved_optimizer_loaded(optimizers, checkpoint):
                     assert actual["state"][index][name] == value
 
 
-@pytest.mark.parametrize("optimizer,variable_packing", [("adamw", False), ("muon", False), ("muon", True)])
-def test_five_completed_epochs_continue_for_three_without_source_changes(tmp_path, monkeypatch, optimizer, variable_packing):
+@pytest.mark.parametrize("optimizer,variable_packing,ar_weight", [
+    ("adamw", False, 0.), ("muon", False, 0.), ("muon", True, 0.), ("adamw", False, .1)])
+def test_five_completed_epochs_continue_for_three_without_source_changes(tmp_path, monkeypatch, optimizer, variable_packing, ar_weight):
     monkeypatch.syspath_prepend(str(ROOT / "scripts/dflash_prefix_joint"))
     source, output = tmp_path / "source", tmp_path / "continuation"
-    batch = create_source(source, optimizer, monkeypatch)
+    batch = create_source(source, optimizer, monkeypatch, ar_weight=ar_weight)
     before = {str(p.relative_to(source)): sha256(p) for p in source.rglob("*") if p.is_file()}
     prep = helper("prepare_continuation")
     check = tmp_path / "check_only"
     prep.prepare(environment(source, check, "1"))
     assert not (check / "checkpoints").exists()
-    prep.prepare(environment(source, output))
+    # Resume must inherit its saved objective, including completed AR warmup.
+    execution = {"RESUME_EXECUTION_PROFILE": "fast"} if ar_weight else {}
+    prep.prepare(dict(environment(source, output), AR_LOSS_WEIGHT="0.9", AR_PRETRAIN_STEPS="999", **execution))
     flat = TrainConfig.resolve(["--config", str(output / "train_config.yaml")]).flatten()
     s = json.loads((output / "joint_settings.json").read_text())
     record = json.loads((output / "continuation.json").read_text())
@@ -141,6 +146,15 @@ def test_five_completed_epochs_continue_for_three_without_source_changes(tmp_pat
     assert flat["lr"] == pytest.approx(1e-5) and s["head_lr"] == pytest.approx(3e-5)
     assert flat["total_seq_len"] == 32 and not s["selector_checkpointing"]
     assert s["guard_mode"] == "project"
+    assert s.get("ar_loss_weight", 0.) == ar_weight
+    assert s.get("ar_pretrain_steps", 0) == int(ar_weight > 0)
+    if ar_weight:
+        assert s["execution_profile"] == "fast" and s["ddp_gradient_as_bucket_view"]
+        assert s["guard_reuse_workspaces"] and not s["ar_logit_checkpointing"]
+        assert not flat["gradient_checkpointing"]
+        source_settings = json.loads((source / "joint_settings.json").read_text())
+        assert s["anchor_chunk_size"] == source_settings["anchor_chunk_size"]
+        assert "execution_overrides" in record
     with monkeypatch.context() as m:
         cli, tm = cpu_and_hooks(m)
         original_builder = cli.build_draft_model

@@ -7,6 +7,7 @@ from speculators.models.dflash.metrics import compute_metrics
 from .core import DFlashPrefixDraftModel, reachable_greedy_prefix
 from .selector_v2 import unary_topk
 from .joint_guard import SelectorUpdateGuard, target_prefix_mask
+from .ar_training import causal_ar_loss, validate_ar_settings
 
 
 def ramp(step, start, duration):
@@ -23,16 +24,30 @@ class JointCompiledScratch(DFlashPrefixDraftModel):
     def configure_joint(self, settings):
         if self.config.prefix_selector_kind != "compiled_prefix_v3" or self.config.prefix_freeze_backbone:
             raise ValueError("Joint scratch requires compiled_prefix_v3 and an unfrozen backbone")
+        validate_ar_settings(settings)
         self.joint_settings = dict(settings)
         self.joint_step = 0
         self.joint_metrics = None
+        self.ddp_gradient_as_bucket_view = settings.get("ddp_gradient_as_bucket_view", False)
         self.config.prefix_detach_backbone = False
         self.config.prefix_loss_scope = "all"
         self.config.prefix_validation_gate_scales = []
         self.selector_guard = (SelectorUpdateGuard(capacity=settings["guard_replay_anchors"],
             add_anchors=settings["guard_add_anchors"], max_backtracks=settings["guard_backtracks"],
-            chunk_size=settings["guard_chunk_size"]) if settings["guard_mode"] == "project" else None)
+            chunk_size=settings["guard_chunk_size"],
+            reuse_workspaces=settings.get("guard_reuse_workspaces", False)) if settings["guard_mode"] == "project" else None)
         return self
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        # The same decoder weights participate in two passes per loss. DDP
+        # cannot safely reuse reentrant checkpoint hooks for those parameters.
+        if getattr(self, "joint_settings", {}).get("ar_loss_weight", 0) > 0:
+            options = dict(gradient_checkpointing_kwargs or {})
+            if options.get("use_reentrant", False):
+                raise ValueError("Joint AR training requires non-reentrant checkpointing")
+            options["use_reentrant"] = False
+            gradient_checkpointing_kwargs = options
+        return super().gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def save_pretrained(self, save_directory, *, state_dict=None, **kwargs):
         result = super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
@@ -73,6 +88,9 @@ class JointCompiledScratch(DFlashPrefixDraftModel):
         reachable = reachable_greedy_prefix(reference, target, reference_covered)
         focus = ramp(self.joint_step, s["focus_start_steps"], s["focus_warmup_steps"]) if self.training else 1.
         alpha = s["loss_alpha"] * ramp(self.joint_step, s["delay_steps"], s["head_warmup_steps"]) if self.training else s["loss_alpha"]
+        ar_pretraining = self.training and self.joint_step < s.get("ar_pretrain_steps", 0)
+        if ar_pretraining:
+            alpha = 0.
         weights = selector_weights(valid, covered, reachable, focus, s["dense_floor"])
         score_parts = []
         for start in range(0, n, s["anchor_chunk_size"]):
@@ -88,7 +106,19 @@ class JointCompiledScratch(DFlashPrefixDraftModel):
         # A fixed valid-position denominator keeps rare shortlist hits from
         # dominating early scratch training. Pool misses still receive dense CE.
         selector_loss = (ce * weights).sum() / valid.float().sum().clamp_min(1)
-        loss = backbone_loss + alpha * selector_loss
+        parallel_weight = 0. if ar_pretraining else 1.
+        loss = parallel_weight * backbone_loss + alpha * selector_loss
+        if s.get("ar_loss_weight", 0) > 0:
+            ar_valid = valid & docs[:, :1].ne(-1)
+            ar_loss, ar_metrics = causal_ar_loss(
+                self, hidden_states, input_ids, document_ids, indices, ar_valid, position_ids)
+            ar_weight = 1. if ar_pretraining else s["ar_loss_weight"]
+            loss = loss + ar_weight * ar_loss
+            metrics.update(ar_metrics)
+            for key, value in (("ar_weight", ar_weight), ("ar_pretraining", float(ar_pretraining)),
+                               ("parallel_weight", parallel_weight)):
+                metrics[key + "_sum"] = loss.detach().new_tensor(value)
+                metrics[key + "_total"] = loss.detach().new_tensor(1.)
         one = loss.detach().new_tensor(1.)
         for key, value in (("loss", loss), ("selector_ce", selector_loss),
                            ("selector_alpha", one * alpha), ("prefix_focus", one * focus)):
@@ -103,7 +133,7 @@ class JointCompiledScratch(DFlashPrefixDraftModel):
                 self._record(metrics, key, values, valid)
             features = dict(hidden=hidden, candidates=candidates, unary=candidate_logits,
                             anchors=anchors, reference=reference, target=target, valid=valid)
-            if self.training and self.selector_guard is not None and self.joint_step >= s["guard_start_steps"]:
+            if self.training and not ar_pretraining and self.selector_guard is not None and self.joint_step >= s["guard_start_steps"]:
                 self.selector_guard.replay.add(features)
             if not self.training:
                 paths = [self.prefix_head.greedy(hidden[i:i+4], candidates[i:i+4], candidate_logits[i:i+4],

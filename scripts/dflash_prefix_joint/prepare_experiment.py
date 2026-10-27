@@ -33,6 +33,25 @@ def number(env, name, default, *, low=0., high=float("inf"), positive=False):
     return value
 
 
+def execution_settings(env, *, prefix="", inherited=None):
+    """Execution-only controls. Resume changes require RESUME_* opt-in."""
+    inherited = inherited or {}
+    profile = env.get(prefix + "EXECUTION_PROFILE", "inherit" if prefix else "memory")
+    if profile not in ({"fast", "memory", "inherit"} if prefix else {"fast", "memory"}):
+        raise ValueError(f"Invalid {prefix}EXECUTION_PROFILE: {profile}")
+    fast = profile == "fast"
+    defaults = dict(backbone_checkpointing=not fast, selector_checkpointing=not fast,
+        ar_logit_checkpointing=not fast, anchor_chunk_size=inherited.get("anchor_chunk_size", 8),
+        ddp_gradient_as_bucket_view=fast, guard_reuse_workspaces=fast)
+    if profile == "inherit":
+        defaults.update({key: inherited[key] for key in defaults if key in inherited})
+    result = {key: (integer(env, prefix + key.upper(), value, 1) if key == "anchor_chunk_size"
+                    else flag(env, prefix + key.upper(), value))
+              for key, value in defaults.items()}
+    result["execution_profile"] = inherited.get("execution_profile", "memory") if profile == "inherit" else profile
+    return result
+
+
 def allocation(env):
     def devices(name):
         values = env[name].split(",")
@@ -95,9 +114,6 @@ def prepare(env):
         focus_start_steps=integer(env, "PREFIX_FOCUS_START_STEPS", 4000),
         focus_warmup_steps=integer(env, "PREFIX_FOCUS_WARMUP_STEPS", 4000, 1),
         dense_floor=number(env, "PREFIX_DENSE_FLOOR", .25, high=1., positive=True),
-        anchor_chunk_size=integer(env, "ANCHOR_CHUNK_SIZE", 8, 1),
-        backbone_checkpointing=flag(env, "BACKBONE_CHECKPOINTING", True),
-        selector_checkpointing=flag(env, "SELECTOR_CHECKPOINTING", True),
         packed_tokens_per_rank=packed_tokens,
         memory_log_every=integer(env, "MEMORY_LOG_EVERY", 100),
         val_batches=integer(env, "VAL_BATCHES", 32, 1),
@@ -108,7 +124,18 @@ def prepare(env):
         guard_add_anchors=integer(env, "GUARD_ADD_ANCHORS", 4, 1),
         guard_chunk_size=integer(env, "GUARD_CHUNK_SIZE", 4, 1),
         guard_backtracks=integer(env, "GUARD_BACKTRACKS", 3),
+        ar_loss_weight=number(env, "AR_LOSS_WEIGHT", 0.),
+        ar_pretrain_steps=integer(env, "AR_PRETRAIN_STEPS", 0),
+        ar_max_anchors=integer(env, "AR_MAX_ANCHORS", 64, 1),
+        ar_logit_chunk_size=integer(env, "AR_LOGIT_CHUNK_SIZE", 128, 1),
+        **execution_settings(env),
     )
+    from speculators.models.dflash_prefix.ar_training import validate_ar_settings
+    validate_ar_settings(settings)
+    # User-facing selector/guard schedules are relative to the joint phase.
+    # Persist absolute steps so continuation retains the original schedules.
+    for name in ("delay_steps", "focus_start_steps", "guard_start_steps"):
+        settings[name] += settings["ar_pretrain_steps"]
     if settings["rank"] % settings["heads"]:
         raise ValueError("PREFIX_RANK must be divisible by PREFIX_HEADS")
     if settings["guard_mode"] not in {"off", "project"}:
@@ -166,6 +193,8 @@ def prepare(env):
     (output / "server_max_model_len.txt").write_text(str(cfg["total_seq_len"] + 256) + "\n")
     (output / "experiment.json").write_text(json.dumps(dict(
         initialization="Random draft and complete compiled head; no trained draft/teacher checkpoint",
+        ar_objective="Causal reference next-token CE on shared draft weights; frozen target prefix before anchor",
+        ar_schedule="Optional AR-only objective warmup, then parallel + weighted AR + selector; parallel diagnostics still computed during warmup",
         frozen_target=str(target), source_recipe=str(recipe), source_recipe_sha256=hashlib.sha256(recipe.read_bytes()).hexdigest(),
         train_config=roundtrip, settings=settings, epochs_are="Full training split passes, without a batch cap",
         constraint_scope="Selector updates on detached rank-local training replay; no backbone/population guarantee",
@@ -174,7 +203,9 @@ def prepare(env):
     print(f"Full epochs={settings['epochs']}; block={block}; proposals={block-1}; top-K=16; rank={settings['rank']}; heads={settings['heads']}")
     print(f"Backbone={cfg['optimizer']}; AdamW LR={cfg['lr']}; Muon LR={cfg['muon_lr']}; selector AdamW LR={settings['head_lr']}")
     print(f"Guard={settings['guard_mode']}; start={settings['guard_start_steps']}; every={settings['guard_every']}; draft checkpoint=NONE")
+    print(f"Execution profile={settings['execution_profile']}; DDP gradient bucket views={settings['ddp_gradient_as_bucket_view']}; guard workspace reuse={settings['guard_reuse_workspaces']}")
     print(f"Recomputation: backbone={settings['backbone_checkpointing']}; selector={settings['selector_checkpointing']}; selector chunk={settings['anchor_chunk_size']}; guard chunk={settings['guard_chunk_size']}")
+    print(f"AR auxiliary weight={settings['ar_loss_weight']}; AR pretrain steps={settings['ar_pretrain_steps']}; max AR anchors={settings['ar_max_anchors']}; logit chunk={settings['ar_logit_chunk_size']}; logit recomputation={settings['ar_logit_checkpointing']}")
     print(f"Packed token budget/rank={packed_tokens}; global budget={packed_tokens * int(env['NUM_TRAIN_NPUS'])}; max anchors/rank={cfg['max_anchors']}; workers/rank={cfg['num_workers']}; prefetch={cfg['prefetch_factor']}")
     if packed_tokens != base["total_seq_len"]:
         print("PACKED_BATCH_CHANGED: optimizer steps/epoch and data order change; revisit step-based warmup/guard schedules and validate model quality.")

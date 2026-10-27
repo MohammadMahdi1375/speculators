@@ -101,6 +101,32 @@ _RECOVERY_SYNC_INTERVAL = 50
 _VAL_SYNC_INTERVAL = 50
 
 
+def _reduce_training_metrics(metrics, distributed):
+    """One collective and host transfer per scalar dtype/device bucket.
+
+    Keep integer counters and FP64 values in their original dtype. Detached
+    packed buffers avoid mutating metrics still owned by a model/guard.
+    Sorted names give all ranks the same packing order.
+    """
+    buckets = {}
+    for name in sorted(metrics):
+        value = metrics[name].detach()
+        if value.numel() != 1:
+            raise ValueError(f"Training metric {name!r} must be scalar")
+        buckets.setdefault((value.device, value.dtype), []).append(
+            (name, value.reshape(()))
+        )
+    result = {}
+    for entries in buckets.values():
+        packed = torch.stack([value for _, value in entries])
+        if distributed:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        result.update(
+            zip((name for name, _ in entries), packed.cpu().tolist(), strict=True)
+        )
+    return result
+
+
 def _should_sync_recovery(
     step: int,
     total_steps: int,
@@ -358,17 +384,17 @@ class Trainer:
     def _setup_model_ddp(self, load_checkpoint: bool):
         self.model.to(self.local_rank)  # type: ignore[arg-type]
 
-        if load_checkpoint:
-            if dist.get_rank() == 0:
-                self.checkpointer.load_model_state_dict(self.model)
-        else:
-            # Fresh init: broadcast rank 0's random initialization to all ranks
-            for param in self.model.parameters():
-                dist.broadcast(param.data, src=0)
-            dist.barrier()
+        if load_checkpoint and dist.get_rank() == 0:
+            self.checkpointer.load_model_state_dict(self.model)
 
-        # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        # DDP constructor synchronizes parameters and buffers, including frozen
+        # target weights. A preceding per-parameter broadcast repeats this work.
+        self.model = DistributedDataParallel(  # type: ignore[assignment]
+            self.model,
+            gradient_as_bucket_view=getattr(
+                self.model, "ddp_gradient_as_bucket_view", False
+            ),
+        )
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -505,6 +531,9 @@ class Trainer:
                 for k, v in batch.items()
             }
 
+            # Release the preceding step's gradients before activations peak.
+            # Forward does not consume .grad; optimizer updates already finished.
+            self._optimizers_zero_grad()
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
@@ -514,7 +543,6 @@ class Trainer:
                 )
 
             timer.mark("fwd")
-            self._optimizers_zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
@@ -543,11 +571,7 @@ class Trainer:
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
-                if self.is_distributed:
-                    for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
-
-                metrics = {k: v.item() for k, v in metrics.items()}
+                metrics = _reduce_training_metrics(metrics, self.is_distributed)
                 world_size = dist.get_world_size() if self.is_distributed else 1
                 metrics = normalize_counted_metrics(metrics, world_size)
                 lr_info = (

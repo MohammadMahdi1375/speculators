@@ -83,16 +83,27 @@ export PREFIX_FOCUS_START_STEPS="${PREFIX_FOCUS_START_STEPS:-4000}"
 export PREFIX_FOCUS_WARMUP_STEPS="${PREFIX_FOCUS_WARMUP_STEPS:-4000}"
 export PREFIX_DENSE_FLOOR="${PREFIX_DENSE_FLOOR:-0.25}"
 export MAX_ANCHORS="${MAX_ANCHORS:-512}"
-export ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-8}"
 export VAL_BATCHES="${VAL_BATCHES:-32}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export LOG_FREQ="${LOG_FREQ:-20}"
 export DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-sdpa}"
 
-# Execution controls: 0 disables recomputation and uses more activation memory.
-# Original behavior remains the default; start a memory-headroom trial with both 0.
-export BACKBONE_CHECKPOINTING="${BACKBONE_CHECKPOINTING:-1}"
-export SELECTOR_CHECKPOINTING="${SELECTOR_CHECKPOINTING:-1}"
+# Training-only AR auxiliary objective; 0 preserves the original experiment.
+# A positive weight adds a causal, shifted-label pass through the SAME drafter.
+# Optional AR-only objective warmup precedes the joint phase. The selector and
+# guard delay/start settings above are measured from the end of that warmup.
+# Resume inherits these settings from the saved run instead of this environment.
+export AR_LOSS_WEIGHT="${AR_LOSS_WEIGHT:-0}"
+export AR_PRETRAIN_STEPS="${AR_PRETRAIN_STEPS:-0}"
+export AR_MAX_ANCHORS="${AR_MAX_ANCHORS:-64}"
+export AR_LOGIT_CHUNK_SIZE="${AR_LOGIT_CHUNK_SIZE:-128}"
+
+# fast: no decoder/selector/AR-logit recomputation, same selector chunk size,
+# DDP gradient bucket views and reusable guard workspaces. Same training recipe.
+# memory: previous recomputation/chunk defaults. Individual exported execution
+# variables override the profile. Resume retains source settings unless explicit
+# RESUME_EXECUTION_PROFILE=fast (or RESUME_* execution controls) is provided.
+export EXECUTION_PROFILE="${EXECUTION_PROFILE:-fast}"
 export MEMORY_LOG_EVERY="${MEMORY_LOG_EVERY:-100}" # per-rank peak GiB; 0 disables
 # Empty preserves the source recipe. This is a packed token batch budget,
 # not the speculative BLOCK_SIZE and not a conventional sample-count batch size.
@@ -118,7 +129,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-$SPEC_MAIN/output/dflash_prefix_compiled_joint_bs${B
 export OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT/joint_${GUARD_MODE}_$(date +%Y%m%d_%H%M%S)_$$}"
 
 # ============================================================
-# A2 NPU allocation (NPU 7 is left free by default)
+# A2 NPU allocation (the defaults use all eight NPUs)
 # ============================================================
 export VLLM_NPUS="${VLLM_NPUS:-0,1}" VLLM_DP="${VLLM_DP:-2}"
 export TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}" NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-6}"

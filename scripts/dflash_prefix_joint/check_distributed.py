@@ -53,9 +53,11 @@ def exercise(rank, world_size, directory, device, settings):
     from speculators.models.dflash_prefix.joint_guard import bf16_replay_copy
     from speculators.models.dflash_prefix.joint_validation import checkpoint_parameters
     from speculators.train.checkpointer import SingleGPUCheckpointer
+    from speculators.train.trainer import _reduce_training_metrics
     local = Path(directory) / f"rank_{rank}"
     local.mkdir(parents=True, exist_ok=False)
     s = dict(settings, block_size=settings["block_size"], delay_steps=0, head_warmup_steps=1,
+        ar_pretrain_steps=0,
         focus_start_steps=0, focus_warmup_steps=1,
         anchor_chunk_size=settings.get("anchor_chunk_size", 2), guard_mode="project",
         guard_start_steps=0, guard_every=1, guard_replay_anchors=4, guard_add_anchors=4,
@@ -63,7 +65,14 @@ def exercise(rank, world_size, directory, device, settings):
     model, batch = make_fixture(local, s, device)
     batch["loss_config"] = resolve_loss_config("ce", "eager")
     batch["hidden_states"].add_(rank * .125)
-    wrapped = DistributedDataParallel(model)
+    wrapped = DistributedDataParallel(model,
+        gradient_as_bucket_view=s.get("ddp_gradient_as_bucket_view", False))
+    scalars = {f"metric_{i}": torch.tensor(float(rank + i), device=device) for i in range(32)}
+    reduced = _reduce_training_metrics(scalars, True)
+    if rank == 0:
+        for i in range(32):
+            if reduced[f"metric_{i}"] != world_size * i + world_size * (world_size - 1) / 2:
+                raise RuntimeError("Packed training metric reduction disagrees with scalar sums")
     check_agreement(model, phase="ddp_initialization", step=0, local=local)
     optimizers = [torch.optim.AdamW([p for n, p in model.named_parameters()
                    if p.requires_grad and not n.startswith("prefix_head.")], lr=1e-4),
@@ -121,7 +130,11 @@ def exercise(rank, world_size, directory, device, settings):
                   nonempty_guard_steps=active, empty_replay_rank_exercised=world_size > 1,
                   bit_exact_rank_agreement=True, gradients_checked_every_step=True,
                   backward_after_saved_validation=True, diagnostic_only=True, preflight_version=2)
-    report.update(backbone_checkpointing=s.get("backbone_checkpointing", True),
+    report.update(ar_loss_weight=s.get("ar_loss_weight", 0),
+                  ar_logit_checkpointing=s.get("ar_logit_checkpointing", True),
+                  ddp_gradient_as_bucket_view=s.get("ddp_gradient_as_bucket_view", False),
+                  guard_reuse_workspaces=s.get("guard_reuse_workspaces", False),
+                  backbone_checkpointing=s.get("backbone_checkpointing", True),
                   selector_checkpointing=s.get("selector_checkpointing", True),
                   anchor_chunk_size=s["anchor_chunk_size"], guard_chunk_size=s["guard_chunk_size"])
     (local / "result.json").write_text(json.dumps(report, indent=2) + "\n")

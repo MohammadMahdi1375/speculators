@@ -102,6 +102,8 @@ def install_hooks(cli, trainer_module, settings):
 
     def setup(self):
         total = self.config.num_epochs * len(self.train_loader)
+        if settings.get("ar_pretrain_steps", 0) >= total:
+            raise ValueError("AR_PRETRAIN_STEPS must leave optimizer steps for joint training")
         if settings["delay_steps"] + settings["head_warmup_steps"] >= total:
             raise ValueError("Selector delay plus warmup must be shorter than the full run")
         if settings["guard_mode"] == "project" and settings["guard_start_steps"] >= total:
@@ -120,6 +122,9 @@ def install_hooks(cli, trainer_module, settings):
                           selector_checkpointing=settings.get("selector_checkpointing", True),
                           anchor_chunk_size=settings["anchor_chunk_size"], guard_chunk_size=settings["guard_chunk_size"],
                           packed_tokens_per_rank=settings.get("packed_tokens_per_rank"))
+            record.update({key: value for key, value in settings.items() if key.startswith("ar_")})
+            record.update({key: settings.get(key) for key in
+                           ("execution_profile", "ddp_gradient_as_bucket_view", "guard_reuse_workspaces")})
             (Path(settings["output_dir"]) / "resolved_schedule.json").write_text(json.dumps(record, indent=2) + "\n")
             print("JOINT_SCRATCH_SCHEDULE " + json.dumps(record), flush=True)
 
@@ -130,7 +135,7 @@ def install_hooks(cli, trainer_module, settings):
         head_optimizer = self.optimizers[-1]
         report = dict(active=0., protected_positions=0., projected=0., rejected=0., accepted_scale=1.,
                       proposed_lost_tokens=0., accepted_lost_tokens=0., backtracks=0.)
-        if self.global_step < settings["delay_steps"]:
+        if self.global_step < max(settings["delay_steps"], settings.get("ar_pretrain_steps", 0)):
             for group in head_optimizer.param_groups:
                 for p in group["params"]:
                     p.grad = None

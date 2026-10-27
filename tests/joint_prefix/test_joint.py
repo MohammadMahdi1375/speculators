@@ -116,9 +116,11 @@ def populated_guard(model, batch):
     return guard
 
 
-def test_rejected_update_restores_weights_and_optimizer_state(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reuse", [False, True])
+def test_rejected_update_restores_weights_and_optimizer_state(tmp_path, monkeypatch, reuse):
     model, batch = helper("check_training").make_fixture(tmp_path, settings())
     guard = populated_guard(model, batch)
+    guard.reuse_workspaces = reuse
     guard.max_backtracks = 0
     params = list(model.prefix_head.parameters())
     optimizer = torch.optim.AdamW(params, lr=10.)
@@ -242,3 +244,25 @@ def test_lr_schedule_is_full_horizon_and_launcher_is_valid():
     assert entry.head_lr_multiplier(200, 10000, 100, 100) == 1
     assert entry.head_lr_multiplier(10000, 10000, 100, 100) == 0
     subprocess.run(["bash", "-n", str(ROOT / "examples/train/train_dflash_prefix_joint.sh")], check=True)
+
+
+def test_ar_configuration_records_objective_and_absolute_stage_schedule(tmp_path):
+    path = helper("prepare_experiment").prepare(dict(recipe_fixture(tmp_path),
+        AR_LOSS_WEIGHT="0.1", AR_PRETRAIN_STEPS="1000", AR_MAX_ANCHORS="32",
+        AR_LOGIT_CHUNK_SIZE="64", AR_LOGIT_CHECKPOINTING="0"))
+    s = json.loads((path.parent / "joint_settings.json").read_text())
+    assert s["ar_loss_weight"] == .1 and s["ar_pretrain_steps"] == 1000
+    assert s["ar_max_anchors"] == 32 and s["ar_logit_chunk_size"] == 64
+    assert not s["ar_logit_checkpointing"]
+    assert s["delay_steps"] == 3000 and s["head_warmup_steps"] == 2000
+    assert s["focus_start_steps"] == 5000 and s["guard_start_steps"] == 5000
+    experiment = json.loads((path.parent / "experiment.json").read_text())
+    assert experiment["settings"] == s
+    assert "reference next-token" in experiment["ar_objective"]
+
+
+def test_ar_warmup_without_joint_ar_weight_is_rejected_before_output(tmp_path):
+    env = dict(recipe_fixture(tmp_path), AR_PRETRAIN_STEPS="1000", AR_LOSS_WEIGHT="0")
+    with pytest.raises(ValueError, match="positive joint"):
+        helper("prepare_experiment").prepare(env)
+    assert not Path(env["OUTPUT_DIR"]).exists()

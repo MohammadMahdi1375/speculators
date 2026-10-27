@@ -39,10 +39,11 @@ def test_ddp_full_model_guard_and_empty_rank(tmp_path):
         assert report["nonempty_guard_steps"] == 4 and report["bit_exact_rank_agreement"]
 
 
-@pytest.mark.parametrize("ranks,no_recompute", [(2, False), (5, False), (5, True)])
-def test_actual_ddp_hooks_survive_guard_and_disk_validation_in_memory(tmp_path, ranks, no_recompute):
+@pytest.mark.parametrize("ranks,no_recompute,ar_weight", [
+    (2, False, 0.), (5, False, 0.), (5, True, 0.), (2, False, .1), (2, True, .1), (5, True, .1)])
+def test_actual_ddp_hooks_survive_guard_and_disk_validation_in_memory(tmp_path, ranks, no_recompute, ar_weight):
     result = subprocess.run([sys.executable, str(Path(__file__).with_name("threaded_ddp_runner.py")),
-        "--ranks", str(ranks), "--output", str(tmp_path)] + (["--no-recompute"] if no_recompute else []),
+        "--ranks", str(ranks), "--output", str(tmp_path), "--ar-loss-weight", str(ar_weight)] + (["--no-recompute"] if no_recompute else []),
         capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     for rank in range(ranks):
@@ -50,6 +51,10 @@ def test_actual_ddp_hooks_survive_guard_and_disk_validation_in_memory(tmp_path, 
         assert report["bit_exact_rank_agreement"] and report["gradients_checked_every_step"]
         assert report["backward_after_saved_validation"] and report["nonempty_guard_steps"] == 4
         assert report["selector_checkpointing"] != no_recompute
+        assert report["ar_logit_checkpointing"] != no_recompute
+        assert report["ddp_gradient_as_bucket_view"] == no_recompute
+        assert report["guard_reuse_workspaces"] == no_recompute
+        assert report["ar_loss_weight"] == ar_weight
 
 
 def test_diagnostic_detects_drift_before_optimizer_without_repairing_it(tmp_path):

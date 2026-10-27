@@ -69,6 +69,7 @@ def check(settings, device_name):
     from safetensors.torch import load_file
     device = torch.device(device_name)
     s = dict(settings, delay_steps=0, head_warmup_steps=1, guard_start_steps=0,
+             ar_pretrain_steps=0,
              guard_mode="project", guard_replay_anchors=4, guard_add_anchors=4,
              guard_chunk_size=settings.get("guard_chunk_size", 2),
              anchor_chunk_size=settings.get("anchor_chunk_size", 2))
@@ -144,6 +145,9 @@ def check(settings, device_name):
                         raise RuntimeError("Compiled graph changed selected tokens")
             graph_checked = True
         report = dict(device=str(device), backbone_and_head_backward=True, optimizer_steps=3,
+            ar_loss_weight=s.get("ar_loss_weight", 0),
+            ar_logit_checkpointing=s.get("ar_logit_checkpointing", True),
+            guard_reuse_workspaces=s.get("guard_reuse_workspaces", False),
             backbone_checkpointing=s.get("backbone_checkpointing", True),
             selector_checkpointing=s.get("selector_checkpointing", True),
             anchor_chunk_size=s["anchor_chunk_size"], guard_chunk_size=s["guard_chunk_size"],

@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inject-gradient-drift", action="store_true")
     parser.add_argument("--no-recompute", action="store_true")
+    parser.add_argument("--ar-loss-weight", type=float, default=0.)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "scripts/dflash_prefix_joint"))
@@ -50,10 +51,13 @@ def main():
     check_distributed.check_agreement = checked
     settings = dict(block_size=16, rank=32, heads=4, top_k=16,
                     compiled_logit_cap=8., loss_alpha=.25, dense_floor=.25,
-                    head_lr=3e-4, head_weight_decay=.01)
+                    head_lr=3e-4, head_weight_decay=.01,
+                    ar_loss_weight=args.ar_loss_weight)
     if args.no_recompute:
         settings.update(backbone_checkpointing=False, selector_checkpointing=False,
-                        anchor_chunk_size=32, guard_chunk_size=16)
+                        ar_logit_checkpointing=False,
+                        ddp_gradient_as_bucket_view=True, guard_reuse_workspaces=True,
+                        anchor_chunk_size=8, guard_chunk_size=4)
     store, errors = dist.HashStore(), []
     def worker(rank):
         try:

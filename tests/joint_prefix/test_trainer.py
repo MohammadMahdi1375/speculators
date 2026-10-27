@@ -12,13 +12,18 @@ from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.models.dflash_prefix.joint_validation import CachedValidationLoader
 
 
-@pytest.mark.parametrize("optimizer,recompute", [("adamw", True), ("muon", True), ("muon", False)])
-def test_actual_cli_builder_and_full_epochs(tmp_path, monkeypatch, optimizer, recompute):
+@pytest.mark.parametrize("optimizer,recompute,ar_weight,ar_pretrain", [
+    ("adamw", True, 0., 0), ("muon", True, 0., 0), ("muon", False, 0., 0),
+    ("adamw", True, .1, 1), ("muon", False, .1, 0)])
+def test_actual_cli_builder_and_full_epochs(tmp_path, monkeypatch, optimizer, recompute, ar_weight, ar_pretrain):
     import speculators.train.cli as cli
     import speculators.train.trainer as trainer_module
     from speculators.losses import resolve_loss_config
     s = dict(settings(), output_dir=str(tmp_path), epochs=2,
-             backbone_checkpointing=recompute, selector_checkpointing=recompute)
+             ar_loss_weight=ar_weight, ar_pretrain_steps=ar_pretrain, delay_steps=ar_pretrain,
+             backbone_checkpointing=recompute, selector_checkpointing=recompute,
+             ar_logit_checkpointing=recompute, ddp_gradient_as_bucket_view=not recompute,
+             guard_reuse_workspaces=not recompute)
     fixture, batch = helper("check_training").make_fixture(tmp_path, s)
     del fixture
     config = TrainConfig.resolve(["--speculator-type", "dflash_prefix",
@@ -64,8 +69,15 @@ def test_actual_cli_builder_and_full_epochs(tmp_path, monkeypatch, optimizer, re
         num_epochs=2, save_path=str(tmp_path / "checkpoints"),
         scheduler_type="cosine", scheduler_warmup_steps=1, gradient_checkpointing=recompute,
         train_call_kwargs=kwargs, val_call_kwargs=kwargs, log_freq=100), train, val)
+    def check_old_gradients_released(module, inputs):
+        if module.training:
+            assert all(p.grad is None for p in module.parameters())
+    model.register_forward_pre_hook(check_old_gradients_released)
     trainer.run_training()
     assert trainer.global_step == 6 and train.epochs == [0, 1]
+    schedule = json.loads((tmp_path / "resolved_schedule.json").read_text())
+    assert schedule["ar_loss_weight"] == ar_weight
+    assert schedule["ar_pretrain_steps"] == ar_pretrain
     assert trainer.schedulers[-1].get_last_lr() == [0., 0.]
     history = [json.loads(line) for line in (tmp_path / "checkpoints/joint_history.jsonl").read_text().splitlines()]
     assert [x["step"] for x in history] == [3, 6]

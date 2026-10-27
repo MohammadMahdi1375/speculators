@@ -94,11 +94,38 @@ def project_displacement(delta, gradient):
 
 
 class SelectorUpdateGuard:
-    def __init__(self, *, capacity=32, add_anchors=4, max_backtracks=3, chunk_size=4):
+    def __init__(self, *, capacity=32, add_anchors=4, max_backtracks=3, chunk_size=4,
+                 reuse_workspaces=False):
         self.replay = FeatureReplay(capacity, add_anchors)
         if max_backtracks < 0 or chunk_size < 1:
             raise ValueError("Invalid backtracking/chunk size")
         self.max_backtracks, self.chunk_size = max_backtracks, chunk_size
+        self.reuse_workspaces = reuse_workspaces
+        self._workspaces = {}
+
+    def _head_copy(self, head, *, replay):
+        """Refresh isolated copies; never swap live DDP parameter storage.
+
+        The two copies have different precision/gradient requirements. They are
+        not children of the training model and are not checkpoint parameters.
+        Refresh on every use, including each backtracking attempt.
+        """
+        if not self.reuse_workspaces:
+            return bf16_replay_copy(head) if replay else copy.deepcopy(head)
+        signature = tuple((name, tuple(t.shape), t.dtype, t.device, t.requires_grad)
+                          for name, t in (*head.named_parameters(), *head.named_buffers()))
+        cached = self._workspaces.get(replay)
+        if cached is None or cached[0] != signature:
+            shadow = bf16_replay_copy(head) if replay else copy.deepcopy(head)
+            self._workspaces[replay] = (signature, shadow)
+        else:
+            shadow = cached[1]
+            # load_state_dict copies into the existing independent storage;
+            # assign=True would alias the live parameters and must not be used.
+            with torch.no_grad():
+                shadow.load_state_dict(head.state_dict(), strict=True)
+        shadow.train(False if replay else head.training)
+        return shadow
 
     def _chunks(self, features):
         if features is not None:
@@ -108,7 +135,7 @@ class SelectorUpdateGuard:
     @torch.no_grad()
     def prefix_masks(self, head, embedding):
         parts = []
-        replay_head = bf16_replay_copy(head)
+        replay_head = self._head_copy(head, replay=True)
         with torch.autocast(embedding.device.type, dtype=torch.bfloat16):
             for f in self._chunks(self.replay.data):
                 chosen = replay_head.greedy(f["hidden"], f["candidates"], f["unary"], f["anchors"],
@@ -127,7 +154,7 @@ class SelectorUpdateGuard:
         """
         count = distributed_sum(masks.float().sum())
         gradient = torch.zeros(sum(p.numel() for p in parameters), device=embedding.device, dtype=torch.float32)
-        shadow = copy.deepcopy(head)
+        shadow = self._head_copy(head, replay=False)
         names = {id(p): name for name, p in head.named_parameters()}
         shadow_named = dict(shadow.named_parameters())
         shadow_parameters = [shadow_named[names[id(p)]] for p in parameters]
